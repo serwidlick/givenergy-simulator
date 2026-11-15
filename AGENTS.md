@@ -60,6 +60,15 @@ ui/              — Web frontend (Vite + vanilla JS, served by Tauri on port 14
 
 ## Version
 
+**0.18.9** — Battery serials are fixed per module (home-energy-manager #476).
+The LV BMS serial (IR 110-114) carried the SOC in hex, so each SOC change
+read as a new battery in HEM's Battery Health; it is now `BAT{:07}` of the
+module number. HR 8-12 (inverter's first-battery serial) now equals module
+0's BMS serial instead of a hard-coded `BAT00001`. One `encode_serial_regs`
+helper packs HR 8-12, the LV BMS and the HV BMU serials. Known limitation:
+serials follow the module's slot and are the same on every plant (no
+persisted per-battery serial yet). 622 Rust + 5/5 scenarios green.
+
 **0.18.8** — A reserve above the SOC holds it instead of lifting it
 (home-energy-manager pauses discharge with reserve = 100; the SOC used to
 jump to 100%). `BatteryEngine` clamps to `[min(min_soc, soc), max(max_soc,

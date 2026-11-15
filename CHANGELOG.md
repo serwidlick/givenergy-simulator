@@ -6,6 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.18.9] - 2026-11-15
+
+### Fixed
+
+- The LV battery serial (BMS IR 110-114) no longer changes with the SOC.
+  It carried the SOC in hex, so every SOC change read as a new battery and
+  home-energy-manager's Battery Health grew a line per serial
+  (home-energy-manager #476). Each module now reports a fixed serial,
+  `BAT0000001`, `BAT0000002`, and so on.
+- The inverter's first-battery serial (HR 8-12) now matches module 0's BMS
+  serial. It was hard-coded to `BAT00001`, so a client reading both saw two
+  names for one battery.
+
+### Changed
+
+- One helper, `encode_serial_regs`, packs every battery serial into its five
+  registers (HR 8-12, the LV BMS and the HV BMU), and the LV and HV serial
+  formats each live in one function.
+
+### Tests
+
+- The LV and HV BMU serials stay fixed whatever the SOC and differ per
+  module; HR 8-12 equals module 0's IR 110-114; serial packing pads with
+  spaces and cuts at 10 characters.
+
 ## [0.18.8] - 2026-11-10
 
 ### Fixed

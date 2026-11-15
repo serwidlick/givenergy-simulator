@@ -232,6 +232,28 @@ fn is_gateway_inverter(inverter_type: &str) -> bool {
     inverter_type.starts_with("Gateway")
 }
 
+/// Pack a serial into the five registers that carry it: 10 Latin-1 characters,
+/// two per register, high byte first, space-padded (longer strings are cut).
+/// Shared by HR 8-12, the LV BMS (IR 110-114) and the HV BMU (IR 114-118).
+fn encode_serial_regs(serial: &str) -> [u16; 5] {
+    let bytes = serial.as_bytes();
+    let byte = |i: usize| bytes.get(i).copied().unwrap_or(b' ');
+    std::array::from_fn(|r| u16::from_be_bytes([byte(r * 2), byte(r * 2 + 1)]))
+}
+
+/// The LV battery module serial (BMS IR 110-114; module 0's also at HR 8-12).
+/// Fixed per module, as a real BMS's: clients key battery history by it, so
+/// it must not move with the SOC (HEM #476).
+fn lv_battery_serial(module_index: usize) -> String {
+    format!("BAT{:07}", module_index + 1)
+}
+
+/// The HV BMU serial (IR 114-118). Fixed per module; must be non-blank for
+/// givenergy-modbus `Bmu.is_valid()`.
+fn hv_bmu_serial(module_index: usize, cells: usize) -> String {
+    format!("BMU{:04X}{:02X}", module_index + 1, cells)
+}
+
 impl RegisterStore {
     /// Create a store pre-populated from the given register definitions.
     pub fn new(defs: Vec<RegisterDef>) -> Self {
@@ -1101,15 +1123,10 @@ impl RegisterStore {
                         self.values.insert(key, 0);
                         continue;
                     }
-                    let v = match def.name.as_str() {
-                        "ge_hr_first_battery_serial_0" => (b'B' as u16) << 8 | b'A' as u16,
-                        "ge_hr_first_battery_serial_1" => (b'T' as u16) << 8 | b'0' as u16,
-                        "ge_hr_first_battery_serial_2" => (b'0' as u16) << 8 | b'0' as u16,
-                        "ge_hr_first_battery_serial_3" => (b'0' as u16) << 8 | b'1' as u16,
-                        "ge_hr_first_battery_serial_4" => (b' ' as u16) << 8 | b' ' as u16,
-                        _ => 0,
-                    };
-                    self.values.insert(key, v);
+                    // Module 0's BMS serial (IR 110-114), so the inverter and
+                    // the battery name the first battery alike (HEM #476).
+                    let regs = encode_serial_regs(&lv_battery_serial(0));
+                    self.values.insert(key, regs[usize::from(def.address - 8)]);
                     continue;
                 }
                 // HR 13-17: Serial number (simulated)
@@ -2844,22 +2861,8 @@ impl RegisterStore {
         regs[45] = throughput_deci; // IR 105: discharge total
         regs[46] = throughput_deci; // IR 106: charge total
 
-        // Serial number: IR 110-114 (5 regs = 10 Latin-1 chars)
-        // Generate a simulated serial
-        let serial_str = format!(
-            "BAT{:04X}{:02X}  ",
-            module_index + 1,
-            (battery.soc_percent as u16) & 0xFF
-        );
-        for i in 0..5 {
-            let c1 = serial_str.as_bytes().get(i * 2).copied().unwrap_or(b' ');
-            let c2 = serial_str
-                .as_bytes()
-                .get(i * 2 + 1)
-                .copied()
-                .unwrap_or(b' ');
-            regs[50 + i] = (c1 as u16) << 8 | c2 as u16;
-        }
+        // Serial number: IR 110-114 (5 regs = 10 Latin-1 chars).
+        regs[50..55].copy_from_slice(&encode_serial_regs(&lv_battery_serial(module_index)));
 
         // usb_device_inserted: IR 115 (raw; reference keeps as uint16)
         regs[55] = 1;
@@ -3014,18 +3017,8 @@ impl RegisterStore {
             }
         }
 
-        // IR 114-118: serial number (5 regs = 10 Latin-1 chars). MUST be non-blank
-        // for Bmu.is_valid(). Mirror the LV projector's encoding.
-        let serial_str = format!("BMU{:04X}{:02X} ", module_index + 1, cells as u16);
-        for i in 0..5 {
-            let c1 = serial_str.as_bytes().get(i * 2).copied().unwrap_or(b' ');
-            let c2 = serial_str
-                .as_bytes()
-                .get(i * 2 + 1)
-                .copied()
-                .unwrap_or(b' ');
-            regs[54 + i] = (c1 as u16) << 8 | c2 as u16; // IR 114+i
-        }
+        // IR 114-118: serial number (5 regs = 10 Latin-1 chars).
+        regs[54..59].copy_from_slice(&encode_serial_regs(&hv_bmu_serial(module_index, cells)));
 
         regs
     }
@@ -8160,6 +8153,106 @@ mod tests {
         }
     }
 
+    /// Five serial registers as the 10 Latin-1 characters a client decodes,
+    /// trimmed (GivTCP / givenergy-modbus `string` converter).
+    fn decode_serial(regs: &[u16]) -> String {
+        regs.iter()
+            .flat_map(|r| r.to_be_bytes())
+            .map(|b| b as char)
+            .collect::<String>()
+            .trim()
+            .to_string()
+    }
+
+    /// IR 110-114 of an LV BMS block.
+    fn bms_serial(bms: &[u16; 60]) -> String {
+        decode_serial(&bms[50..55])
+    }
+
+    /// IR 114-118 of an HV BMU block.
+    fn bmu_serial(bmu: &[u16; 60]) -> String {
+        decode_serial(&bmu[54..59])
+    }
+
+    #[test]
+    fn encode_serial_regs_packs_ten_latin1_chars_space_padded() {
+        let regs = encode_serial_regs("AB12");
+        assert_eq!(regs[0], u16::from_be_bytes(*b"AB"));
+        assert_eq!(regs[1], u16::from_be_bytes(*b"12"));
+        assert_eq!(regs[2..], [u16::from_be_bytes(*b"  "); 3]);
+        // Longer than 10 characters: the rest is dropped.
+        assert_eq!(
+            decode_serial(&encode_serial_regs("ABCDEFGHIJKL")),
+            "ABCDEFGHIJ"
+        );
+    }
+
+    #[test]
+    fn inverter_first_battery_serial_names_module_zero_as_its_bms_does() {
+        // HR 8-12 is the inverter's view of the first battery; IR 110-114 on
+        // slave 0x32 is that battery's own. They must agree, or a client that
+        // reads both sees two batteries (HEM #476).
+        let state = PlantState::with_battery_count(test_ts(), 2);
+        let mut store = RegisterStore::new(default_register_catalogue());
+        store.project_from_state(&state);
+        let hr: Vec<u16> = (8..13)
+            .map(|a| store.read_by_space(a, RegisterSpace::Holding).unwrap())
+            .collect();
+        let bms0 = store.project_battery_bms(&state.batteries[0], 0);
+        assert_eq!(decode_serial(&hr), bms_serial(&bms0));
+        assert_eq!(hr[..], bms0[50..55]);
+    }
+
+    #[test]
+    fn bmu_serial_is_fixed_per_module_whatever_the_soc() {
+        let mut state = PlantState::with_battery_count(test_ts(), 3);
+        let store = RegisterStore::new(default_register_catalogue());
+        let before = bmu_serial(&store.project_battery_bmu(&state.batteries[0], 0));
+        for soc in [4.0, 37.0, 50.0, 99.0, 100.0] {
+            state.batteries[0].soc_percent = soc;
+            assert_eq!(
+                bmu_serial(&store.project_battery_bmu(&state.batteries[0], 0)),
+                before,
+                "BMU serial changed at {soc}% SOC"
+            );
+        }
+        assert!(
+            before.len() >= 9 && before.chars().all(|c| c.is_ascii_alphanumeric()),
+            "{before:?}"
+        );
+        let serials: std::collections::HashSet<String> = (0..3)
+            .map(|m| bmu_serial(&store.project_battery_bmu(&state.batteries[m], m)))
+            .collect();
+        assert_eq!(serials.len(), 3, "one serial per module: {serials:?}");
+    }
+
+    #[test]
+    fn bms_serial_is_fixed_per_module_whatever_the_soc() {
+        // A battery's serial is its identity: HEM keys battery health by it
+        // (HEM #427). It once carried the SOC in hex, so every SOC change
+        // read as a new battery and HEM's Battery Health grew a line per
+        // serial (HEM #476).
+        let mut state = PlantState::with_battery_count(test_ts(), 2);
+        let store = RegisterStore::new(default_register_catalogue());
+        let before = bms_serial(&store.project_battery_bms(&state.batteries[0], 0));
+        for soc in [4.0, 37.0, 50.0, 99.0, 100.0] {
+            state.batteries[0].soc_percent = soc;
+            assert_eq!(
+                bms_serial(&store.project_battery_bms(&state.batteries[0], 0)),
+                before,
+                "serial changed at {soc}% SOC"
+            );
+        }
+        // Ten alphanumerics, as a real BMS serial, and one per module.
+        assert_eq!(before.len(), 10, "{before:?}");
+        assert!(
+            before.chars().all(|c| c.is_ascii_alphanumeric()),
+            "{before:?}"
+        );
+        let other = bms_serial(&store.project_battery_bms(&state.batteries[1], 1));
+        assert_ne!(before, other);
+    }
+
     #[test]
     fn hv_bms_discovery_reports_one_bcu() {
         // Cold HV discovery reads IR(60,5) at slave 0xA0; IR(61) = number of BCUs.
@@ -8238,9 +8331,8 @@ mod tests {
             }
             // IR 114-118 serial: at least one register must carry a non-space byte
             // so the decoded serial is non-blank.
-            let sn_bytes: Vec<u8> = (0..5).flat_map(|r| bmu[54 + r].to_be_bytes()).collect();
             assert!(
-                sn_bytes.iter().any(|&b| b != b' ' && b != 0),
+                !bmu_serial(&bmu).is_empty(),
                 "module {m} serial must be non-blank for Bmu.is_valid()"
             );
         }
@@ -9071,8 +9163,8 @@ mod tests {
         let bms1 = bms.project_battery_bms(&state.batteries[1], 1);
         assert_eq!(bms0[40], 75); // module 0 SOC
         assert_eq!(bms1[40], 30); // module 1 SOC
-        // Different serials
-        assert_ne!(bms0[53], bms1[53], "Serials should differ");
+        // Different serials (the whole of IR 110-114)
+        assert_ne!(bms0[50..55], bms1[50..55], "Serials should differ");
     }
 
     // ===================================================================
