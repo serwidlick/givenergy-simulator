@@ -241,17 +241,28 @@ fn encode_serial_regs(serial: &str) -> [u16; 5] {
     std::array::from_fn(|r| u16::from_be_bytes([byte(r * 2), byte(r * 2 + 1)]))
 }
 
-/// The LV battery module serial (BMS IR 110-114; module 0's also at HR 8-12).
-/// Fixed per module, as a real BMS's: clients key battery history by it, so
-/// it must not move with the SOC (HEM #476).
-fn lv_battery_serial(module_index: usize) -> String {
-    format!("BAT{:07}", module_index + 1)
+/// The LV battery module serial (BMS IR 110-114; module 0's also at HR 8-12):
+/// the module's assigned `serial`, or, when it has none (plants saved before
+/// serials were persisted, scenario/test fixtures), the positional
+/// `BAT0000001`, ... Never moves with the SOC: clients key battery history by
+/// it (HEM #476).
+fn lv_battery_serial(battery: &sim_models::BatteryState, module_index: usize) -> String {
+    if battery.serial.is_empty() {
+        format!("BAT{:07}", module_index + 1)
+    } else {
+        battery.serial.clone()
+    }
 }
 
-/// The HV BMU serial (IR 114-118). Fixed per module; must be non-blank for
+/// The HV BMU serial (IR 114-118): the module's assigned `serial`, or the
+/// positional `BMU000118`, ... when it has none. Must be non-blank for
 /// givenergy-modbus `Bmu.is_valid()`.
-fn hv_bmu_serial(module_index: usize, cells: usize) -> String {
-    format!("BMU{:04X}{:02X}", module_index + 1, cells)
+fn hv_bmu_serial(battery: &sim_models::BatteryState, module_index: usize, cells: usize) -> String {
+    if battery.serial.is_empty() {
+        format!("BMU{:04X}{:02X}", module_index + 1, cells)
+    } else {
+        battery.serial.clone()
+    }
 }
 
 impl RegisterStore {
@@ -1125,7 +1136,10 @@ impl RegisterStore {
                     }
                     // Module 0's BMS serial (IR 110-114), so the inverter and
                     // the battery name the first battery alike (HEM #476).
-                    let regs = encode_serial_regs(&lv_battery_serial(0));
+                    let regs = encode_serial_regs(&lv_battery_serial(
+                        state.batteries.first().unwrap_or(&state.battery),
+                        0,
+                    ));
                     self.values.insert(key, regs[usize::from(def.address - 8)]);
                     continue;
                 }
@@ -2862,7 +2876,10 @@ impl RegisterStore {
         regs[46] = throughput_deci; // IR 106: charge total
 
         // Serial number: IR 110-114 (5 regs = 10 Latin-1 chars).
-        regs[50..55].copy_from_slice(&encode_serial_regs(&lv_battery_serial(module_index)));
+        regs[50..55].copy_from_slice(&encode_serial_regs(&lv_battery_serial(
+            battery,
+            module_index,
+        )));
 
         // usb_device_inserted: IR 115 (raw; reference keeps as uint16)
         regs[55] = 1;
@@ -3018,7 +3035,11 @@ impl RegisterStore {
         }
 
         // IR 114-118: serial number (5 regs = 10 Latin-1 chars).
-        regs[54..59].copy_from_slice(&encode_serial_regs(&hv_bmu_serial(module_index, cells)));
+        regs[54..59].copy_from_slice(&encode_serial_regs(&hv_bmu_serial(
+            battery,
+            module_index,
+            cells,
+        )));
 
         regs
     }
@@ -8201,6 +8222,44 @@ mod tests {
         let bms0 = store.project_battery_bms(&state.batteries[0], 0);
         assert_eq!(decode_serial(&hr), bms_serial(&bms0));
         assert_eq!(hr[..], bms0[50..55]);
+    }
+
+    #[test]
+    fn an_assigned_battery_serial_is_what_every_serial_register_reports() {
+        // A plant created by the GUI or `simulate` carries per-plant serials;
+        // the LV BMS, the HV BMU and the inverter's HR 8-12 all report them.
+        let mut state = PlantState::with_battery_count(test_ts(), 2);
+        state.assign_battery_serials("K3F9Q");
+        let mut store = RegisterStore::new(default_register_catalogue());
+        store.project_from_state(&state);
+        for m in 0..2 {
+            let want = format!("BATK3F9Q0{}", m + 1);
+            let b = &state.batteries[m];
+            assert_eq!(bms_serial(&store.project_battery_bms(b, m)), want);
+            assert_eq!(bmu_serial(&store.project_battery_bmu(b, m)), want);
+        }
+        let hr: Vec<u16> = (8..13)
+            .map(|a| store.read_by_space(a, RegisterSpace::Holding).unwrap())
+            .collect();
+        assert_eq!(decode_serial(&hr), "BATK3F9Q01");
+    }
+
+    #[test]
+    fn a_battery_serial_follows_the_battery_not_its_slot() {
+        // Module 1 moved to slot 0 (module 0 removed) still reports its own
+        // serial, so a client does not pin its history on the removed pack.
+        let mut state = PlantState::with_battery_count(test_ts(), 2);
+        state.assign_battery_serials("K3F9Q");
+        state.batteries.remove(0);
+        state.sync_battery_from_vec();
+        let mut store = RegisterStore::new(default_register_catalogue());
+        store.project_from_state(&state);
+        let b = &state.batteries[0];
+        assert_eq!(bms_serial(&store.project_battery_bms(b, 0)), "BATK3F9Q02");
+        let hr: Vec<u16> = (8..13)
+            .map(|a| store.read_by_space(a, RegisterSpace::Holding).unwrap())
+            .collect();
+        assert_eq!(decode_serial(&hr), "BATK3F9Q02");
     }
 
     #[test]

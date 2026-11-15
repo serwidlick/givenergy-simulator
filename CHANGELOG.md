@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.18.10] - 2026-11-15
+
+### Fixed
+
+- Battery serials now belong to the battery, not to its slot or to the
+  simulator. `BatteryState` gains a persisted `serial` (`#[serde(default)]`),
+  and plants created by the GUI (`create_plant`, the Gateway AIO stack
+  included) and by `giv-sim simulate` give each module one built from a
+  random per-plant tag (`BATK3F9Q01`, ...). A re-created plant (a new pack)
+  or a second simulator no longer continues an old pack's history in a
+  client that keys batteries by serial, and a module that changes slot keeps
+  its serial (home-energy-manager #476 follow-up). The LV BMS (IR 110-114),
+  the HV BMU (IR 114-118) and HR 8-12 all report it. Plants saved before
+  this, and the scenario/test fixtures, have no serial and keep the
+  positional `BAT0000001` / `BMU000118` they read in 0.18.9.
+
+### Tests
+
+- Serial defaults, old-save loading, save/load round trip, assignment
+  (keeps existing serials, never duplicates), plant-tag shape and spread;
+  projection of an assigned serial to every serial register and across a
+  slot change; GUI and CLI plant creation give per-plant serials.
+
 ## [0.18.9] - 2026-11-15
 
 ### Fixed

@@ -160,6 +160,8 @@ fn build_plant_state(
         state.sync_battery_from_vec();
         state
     };
+    // A created plant is a new pack: its own serials (HEM #476).
+    plant_state.assign_battery_serials(&sim_models::new_plant_tag());
     plant_state.config.solar_peak_watts = peak_watts;
     plant_state.config.latitude = latitude;
     plant_state.config.tick_interval_secs = tick_interval;
@@ -2097,6 +2099,30 @@ mod tests {
             .and_hms_opt(12, 0, 0)
             .unwrap();
         build_plant_state(params, now).0
+    }
+
+    fn serials(p: &sim_models::PlantState) -> Vec<String> {
+        p.batteries.iter().map(|b| b.serial.clone()).collect()
+    }
+
+    #[test]
+    fn build_plant_state_gives_each_module_its_own_serial_for_this_plant() {
+        // A created plant is a new pack: per-plant serials, so re-creating it
+        // (or a second simulator) does not continue the old pack's history in
+        // a client that keys batteries by serial (HEM #476).
+        for json in [
+            serde_json::json!({ "battery_count": 3 }),
+            serde_json::json!({ "inverter_type": "Gateway12kW" }),
+        ] {
+            let a = plant_from(json.clone());
+            let b = plant_from(json);
+            let sa = serials(&a);
+            assert!(sa.iter().all(|s| s.len() == 10), "{sa:?}");
+            let unique: std::collections::HashSet<_> = sa.iter().collect();
+            assert_eq!(unique.len(), sa.len(), "one serial per module: {sa:?}");
+            assert_eq!(a.battery.serial, sa[0], "battery mirror synced");
+            assert_ne!(sa, serials(&b), "a re-created plant is a new pack");
+        }
     }
 
     #[test]

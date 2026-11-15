@@ -60,6 +60,15 @@ ui/              — Web frontend (Vite + vanilla JS, served by Tauri on port 14
 
 ## Version
 
+**0.18.10** — Battery serials are persisted per module (follow-up to
+home-energy-manager #476). `BatteryState.serial` (`#[serde(default)]`) is assigned once
+at user-facing plant creation (`create_plant`, Gateway stack included, and
+`simulate`) from `new_plant_tag()`: `BAT` + random 5-char tag + module number.
+A re-created plant or a second simulator gets new serials, and a module that
+changes slot keeps its own. LV BMS, HV BMU and HR 8-12 all report it; an empty
+serial (old saves, fixtures) falls back to the positional `BAT0000001` /
+`BMU000118`. 631 Rust + 5/5 scenarios + 49 Playwright green.
+
 **0.18.9** — Battery serials are fixed per module (home-energy-manager #476).
 The LV BMS serial (IR 110-114) carried the SOC in hex, so each SOC change
 read as a new battery in HEM's Battery Health; it is now `BAT{:07}` of the
@@ -371,6 +380,18 @@ needs 1 BCU + 5 BMU = **6 IR(60,60) reads per cycle**. Projectors:
 
 If battery data comes back empty for an HV inverter, the cluster path (not the LV
 `0x32` path) is what needs serving — this was the original gap.
+
+### Battery serials are persisted per module
+
+`BatteryState.serial` is the module's identity on the wire (LV BMS IR
+110-114, HV BMU IR 114-118, and module 0's at HR 8-12); clients key battery
+history by it. User-facing plant creation (`create_plant`, `simulate`) calls
+`assign_battery_serials(new_plant_tag())` once, giving `BAT` + 5-char plant
+tag + module number. Never derive it from live state (SOC, slot): that made
+HEM grow a Battery Health line per serial (#476). Empty = unassigned (old
+saves, `PlantState::new` / `with_battery_count` fixtures): the projectors fall
+back to the positional `BAT0000001` / `BMU000118`. Tests that need a known
+serial pass an explicit tag.
 
 ### State sync pattern
 

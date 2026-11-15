@@ -762,6 +762,14 @@ pub struct BatteryState {
     /// Terminal current in amps (signed: positive = charging).
     #[serde(default)]
     pub current_a: f64,
+    /// The module's serial (10 characters), its identity to clients, which
+    /// key battery history by it (home-energy-manager #427/#476). Assigned
+    /// once at plant creation (`PlantState::assign_battery_serials`) and
+    /// persisted. Empty = unassigned (plants saved before it existed, and the
+    /// scenario/test fixtures): the register projection then falls back to
+    /// the positional `BAT0000001`, `BAT0000002`, ...
+    #[serde(default)]
+    pub serial: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -932,8 +940,52 @@ impl Default for BatteryState {
             cycle_count: 0.0,
             voltage_v: 48.0,
             current_a: 0.0,
+            serial: String::new(),
         }
     }
+}
+
+/// Give every module in `batteries` without a serial one built from
+/// `plant_tag` (`BAT` + tag + module number: `BATK3F9Q01`, ...), keeping any
+/// serial a module already has and never reusing one. See
+/// `PlantState::assign_battery_serials`, which also syncs `battery`.
+pub fn assign_battery_serials(batteries: &mut [BatteryState], plant_tag: &str) {
+    let mut next = 1usize;
+    for i in 0..batteries.len() {
+        if !batteries[i].serial.is_empty() {
+            continue;
+        }
+        let serial = loop {
+            let candidate = format!("BAT{plant_tag}{next:02}");
+            next += 1;
+            if !batteries.iter().any(|b| b.serial == candidate) {
+                break candidate;
+            }
+        };
+        batteries[i].serial = serial;
+    }
+}
+
+/// A random 5-character plant tag (digits and capitals) that makes one
+/// plant's battery serials differ from another's, so a re-created plant (a
+/// new pack) or a second simulator does not continue an old pack's history
+/// in a client. Uses std's per-call randomly keyed `RandomState`, so no RNG
+/// dependency.
+pub fn new_plant_tag() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    h.write_u128(nanos);
+    let mut n = h.finish();
+    (0..5)
+        .map(|_| {
+            let d = (n % 36) as u8;
+            n /= 36;
+            char::from(if d < 10 { b'0' + d } else { b'A' + d - 10 })
+        })
+        .collect()
 }
 
 /// Solar / PV state snapshot.
@@ -1470,6 +1522,15 @@ impl PlantState {
     /// Aggregate net power in kW (positive = charging bank).
     pub fn total_battery_power_kw(&self) -> f64 {
         self.batteries.iter().map(|b| b.power_kw).sum()
+    }
+
+    /// Give every module without a serial one built from `plant_tag`:
+    /// `BAT` + tag + the module number (`BATK3F9Q01`, ...). A module that
+    /// already has a serial keeps it, and no number already taken is reused.
+    /// Call once when a plant is created, with `new_plant_tag()`.
+    pub fn assign_battery_serials(&mut self, plant_tag: &str) {
+        assign_battery_serials(&mut self.batteries, plant_tag);
+        self.sync_battery_from_vec();
     }
 
     /// Sync `self.battery` to reflect `self.batteries[0]`.
@@ -2349,6 +2410,80 @@ impl Default for Schedule {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn serial_test_ts() -> NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 6, 21)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn battery_serial_defaults_to_unassigned_and_old_saves_load_without_one() {
+        assert_eq!(BatteryState::default().serial, "");
+        // A plant saved before 0.18.10 has no `serial`: it loads as unassigned,
+        // so the projection keeps the positional BAT0000001 it always read.
+        let mut v = serde_json::to_value(BatteryState::default()).unwrap();
+        v.as_object_mut().unwrap().remove("serial");
+        let b: BatteryState = serde_json::from_value(v).unwrap();
+        assert_eq!(b.serial, "");
+    }
+
+    #[test]
+    fn battery_serial_survives_a_save_and_load() {
+        let mut state = PlantState::with_battery_count(serial_test_ts(), 2);
+        state.assign_battery_serials("K3F9Q");
+        let json = serde_json::to_string(&state).unwrap();
+        let back: PlantState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.batteries[0].serial, "BATK3F9Q01");
+        assert_eq!(back.batteries[1].serial, "BATK3F9Q02");
+        assert_eq!(back.battery.serial, "BATK3F9Q01");
+    }
+
+    #[test]
+    fn assign_battery_serials_gives_each_module_ten_alphanumerics_from_the_plant_tag() {
+        let mut state = PlantState::with_battery_count(serial_test_ts(), 6);
+        state.assign_battery_serials("K3F9Q");
+        let serials: Vec<&str> = state.batteries.iter().map(|b| b.serial.as_str()).collect();
+        assert_eq!(
+            serials,
+            [
+                "BATK3F9Q01",
+                "BATK3F9Q02",
+                "BATK3F9Q03",
+                "BATK3F9Q04",
+                "BATK3F9Q05",
+                "BATK3F9Q06"
+            ]
+        );
+        // `battery` mirrors `batteries[0]`.
+        assert_eq!(state.battery.serial, "BATK3F9Q01");
+    }
+
+    #[test]
+    fn assign_battery_serials_keeps_a_module_s_serial_and_never_duplicates_one() {
+        // A module already carrying a serial keeps it (it is that battery's
+        // identity); new modules take the next free number.
+        let mut state = PlantState::with_battery_count(serial_test_ts(), 3);
+        state.batteries[1].serial = "BATK3F9Q01".into();
+        state.assign_battery_serials("K3F9Q");
+        let serials: Vec<&str> = state.batteries.iter().map(|b| b.serial.as_str()).collect();
+        assert_eq!(serials, ["BATK3F9Q02", "BATK3F9Q01", "BATK3F9Q03"]);
+    }
+
+    #[test]
+    fn new_plant_tag_is_five_alphanumerics_and_differs_between_plants() {
+        let tags: std::collections::HashSet<String> = (0..50).map(|_| new_plant_tag()).collect();
+        assert!(tags.len() >= 49, "plant tags collide: {tags:?}");
+        for t in &tags {
+            assert_eq!(t.len(), 5, "{t:?}");
+            assert!(
+                t.chars()
+                    .all(|c| c.is_ascii_digit() || c.is_ascii_uppercase()),
+                "{t:?}"
+            );
+        }
+    }
 
     #[test]
     fn pause_is_an_allowlist_of_the_models_givtcp_gives_it() {

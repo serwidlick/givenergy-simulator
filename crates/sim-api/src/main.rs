@@ -362,7 +362,7 @@ fn nearest_battery_size(requested: f64) -> f64 {
 /// of the nearest supported size, at `soc_percent` (clamped 0-100) and
 /// `soh_percent` (via `BatteryState::apply_soh`, floored at 50%), with
 /// power limits capped at each module's share of the inverter's battery
-/// rating.
+/// rating. Each module gets a serial unique to this plant.
 fn build_simulate_batteries(
     inv_type: &str,
     count: usize,
@@ -373,7 +373,7 @@ fn build_simulate_batteries(
     let count = count.clamp(1, 6);
     let size = nearest_battery_size(battery_size);
     let per_module_max_kw = sim_models::max_batt_w_for_inverter(inv_type) / 1000.0 / count as f64;
-    (0..count)
+    let mut batteries: Vec<_> = (0..count)
         .map(|_| {
             let mut b = sim_models::BatteryState {
                 soc_percent: soc_percent.clamp(0.0, 100.0),
@@ -383,7 +383,10 @@ fn build_simulate_batteries(
             b.apply_soh(soh_percent / 100.0, per_module_max_kw);
             b
         })
-        .collect()
+        .collect();
+    // Each run is a new plant with its own battery serials (HEM #476).
+    sim_models::assign_battery_serials(&mut batteries, &sim_models::new_plant_tag());
+    batteries
 }
 
 /// Apply inverter-type configuration to a PlantState.
@@ -1822,6 +1825,18 @@ mod tests {
             assert_eq!(b.cycle_count, 0.0);
             assert!(b.max_charge_kw <= per_module_kw + 1e-9);
         }
+    }
+
+    #[test]
+    fn simulate_batteries_each_carry_a_serial_for_this_plant() {
+        let a = build_simulate_batteries("ACCoupled", 3, 8.2, 50.0, 100.0);
+        let b = build_simulate_batteries("ACCoupled", 3, 8.2, 50.0, 100.0);
+        let sa: Vec<&str> = a.iter().map(|m| m.serial.as_str()).collect();
+        let sb: Vec<&str> = b.iter().map(|m| m.serial.as_str()).collect();
+        assert!(sa.iter().all(|s| s.len() == 10), "{sa:?}");
+        let unique: std::collections::HashSet<_> = sa.iter().collect();
+        assert_eq!(unique.len(), 3, "{sa:?}");
+        assert_ne!(sa, sb, "each simulate run is its own plant");
     }
 
     #[test]
