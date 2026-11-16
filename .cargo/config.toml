@@ -1,0 +1,9 @@
+# Keep build artifacts from filling the disk. Cargo's incremental cache keeps a
+# full session tree per (crate, hash-of-flags) and never evicts trees built with
+# flags it no longer sees, so each abandoned flag combination leaves a copy
+# behind. incremental = false stops that; debug = "line-tables-only" keeps
+# backtraces readable (file:line) while dropping the bulk of the debug info.
+# Add `debug = 0` too if you never attach a debugger.
+[profile.dev]
+incremental = false
+debug = "line-tables-only"
