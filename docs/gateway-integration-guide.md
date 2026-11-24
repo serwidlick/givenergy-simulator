@@ -10,6 +10,16 @@
 > real parallel hardware), and the `dewet22/givenergy-modbus` client library (used by the
 > givenergy-local HA integration). For pure byte-level reference see
 > [`gateway-register-reference.md`](./gateway-register-reference.md).
+>
+> **Correction (HEM #456, November 2026).** There is only one Gateway layout. An
+> earlier version of this document, copied from `dewet22/givenergy-modbus`
+> `select_gateway()`, described a "V2" variant chosen by `IR(1603) >= 10`. That test is
+> wrong: IR(1603) holds the last two version digits as bytes (`GAAA0014` is `0x0104`),
+> so every real Gateway is "V2" by it. GivTCP's pinned fork dropped it after its first
+> live capture. The live layout is: `uint32` totals **high register first**, and AIO
+> serials in a five-register stride from IR 1841 (aio1 1841-1845, aio2 1846-1850,
+> aio3 1851-1855). Wherever this document still shows a V1/V2 split, read it as the
+> live ("V1 order") column with the serial addresses above.
 
 ---
 
@@ -94,7 +104,7 @@ The linkage is **data-level, not connection-level**. The Gateway's aggregation b
 | Linkage field | Reg(s) | What it tells the client |
 |---|---|---|
 | `first_inverter_serial_number` | IR 1627–1631 | Serial of the primary (master) AIO |
-| `aio1/2/3_serial_number` | IR 1831–1835 / 1838–1842 / 1845–1849 (V1) | Serial of each child AIO slot |
+| `aio1/2/3_serial_number` | IR 1841–1845 / 1846–1850 / 1851–1855 | Serial of each child AIO slot |
 | `parallel_aio_num` | IR 1700 | How many AIOs are configured (1–3) |
 | `parallel_aio_online_num` | IR 1701 | How many are currently online |
 | `p_aio1/2/3_inverter` | IR 1816 / 1817 / 1818 | Per-AIO inverter power (W, signed) |
@@ -140,7 +150,7 @@ elif serial.startswith(("CE","BE")):   # typical hybrid serials
 |---|---|---|---|
 | 1 | **Serial prefix** `GW` | HR(13–17) | e.g. `GW2423G192` — **primary classifier** |
 | 2 | Device Type Code | HR(0) | `0x7001` (family `0x7xxx`) |
-| 3 | Firmware version string | IR(1600–1603) | `GA000009` (V1) / `GA000010` (V2) |
+| 3 | Firmware version string | IR(1600–1603) | `GAAA0014` (live capture) |
 
 **Validity:** the gateway model's `is_valid()` is `software_version is not None` — i.e.
 IR(1600–1603) must decode to a non-empty string. If a non-gateway device is queried, that
@@ -165,7 +175,7 @@ for the config/identity block, same slave for the IR 1600–1859 bank). All mult
 | Device name | — | HR(0) DTC | u16 | `0x7001` → "Gateway" |
 | **Serial number** | `serial_number` (derived) | HR(13–17) | serial, 5 regs | `GW2423G192` |
 | Firmware version | `software_version` | IR(1600–1603) | `gateway_version` | `GA000009` |
-| Firmware variant | (from `software_version`) | IR(1603) | u16 | 9 → V1; ≥10 → V2 |
+| Firmware version digits | (from `software_version`) | IR(1603) | u16 | last two digits as bytes (`0x0104` = 14); not a layout selector |
 | Work mode | `work_mode` | IR(1604) | WorkMode enum | `2` = On Grid |
 | Primary AIO serial | `first_inverter_serial_number` | IR(1627–1631) | serial, 5 regs | `SA24230001` |
 | Faults | `gateway_fault_codes` | IR(1622–1623) | u32 bitmask → [names] | `[]` = healthy |
@@ -213,16 +223,16 @@ For AIO index `n` ∈ {1,2,3}. Single-AIO topology: only the AIO1 columns are no
 | Discharge today | `e_aio{N}_discharge_today` | 1750 | 1753 | 1756 | ÷10 kWh |
 | Discharge total | `e_aio{N}_discharge_total` | 1751–1752 | 1754–1755 | 1757–1758 | u32 ÷10 kWh |
 | Inverter power | `p_aio{N}_inverter` | 1816 | 1817 | 1818 | W, **int16** |
-| Serial number | `aio{N}_serial_number` | 1831–1835 | 1838–1842 | 1845–1849 | serial, 5 regs (V1) |
+| Serial number | `aio{N}_serial_number` | 1841–1845 | 1846–1850 | 1851–1855 | serial, 5 regs |
 
 ### 3.5 Battery gauge (aggregate + per-AIO SOC)
 
 | Display element | Register name | Reg(s) | Type | Notes |
 |---|---|---|---|---|
 | Battery charge today | `e_battery_charge_today` | IR 1795 | ÷10 kWh | aggregate |
-| Battery charge total | `e_battery_charge_total` | IR 1796–1797 | u32 ÷10 kWh | V1 byte order |
+| Battery charge total | `e_battery_charge_total` | IR 1796–1797 | u32 ÷10 kWh | high register first |
 | Battery discharge today | `e_battery_discharge_today` | IR 1798 | ÷10 kWh | aggregate |
-| Battery discharge total | `e_battery_discharge_total` | IR 1799–1800 | u32 ÷10 kWh | V1 byte order |
+| Battery discharge total | `e_battery_discharge_total` | IR 1799–1800 | u32 ÷10 kWh | high register first |
 | **AIO1 SOC** | `aio1_soc` | IR 1801 | u16 % | 0–100 |
 | AIO2 SOC | `aio2_soc` | IR 1802 | u16 % | 0 if absent |
 | AIO3 SOC | `aio3_soc` | IR 1803 | u16 % | 0 if absent |
@@ -233,7 +243,7 @@ For AIO index `n` ∈ {1,2,3}. Single-AIO topology: only the AIO1 columns are no
 
 ### 3.6 Energy bar charts (daily + lifetime)
 
-| Flow | Register name (today / total) | Today reg | Total regs (V1) | Scale |
+| Flow | Register name (today / total) | Today reg | Total regs | Scale |
 |---|---|---|---|---|
 | Grid import | `e_grid_import_today` / `_total` | 1640 | 1641, 1642 | ÷10 kWh |
 | PV generation | `e_pv_today` / `_total` | 1643 | 1644, 1645 | ÷10 kWh |
@@ -244,30 +254,19 @@ For AIO index `n` ∈ {1,2,3}. Single-AIO topology: only the AIO1 columns are no
 
 ---
 
-## Part 4 — The V1/V2 variant trap (decode energy totals correctly or get garbage)
+## Part 4 — One layout: totals high register first, serials from IR 1841
 
-Two firmware variants differ in wire encoding. Pick the wrong one and every `uint32`
-energy total is off by orders of magnitude.
-
-| Variant | Selector | uint32 byte order | AIO serial addresses |
-|---|---|---|---|
-| **V1** | `IR(1603) < 10` | **high register first**, then low | aio1 @ 1831–1835 |
-| **V2** | `IR(1603) >= 10` | **low register first**, then high (swapped) | aio1 @ 1841–1845 |
+There is a single live layout (see the correction at the top). Do **not** read IR(1603)
+as a selector: it holds the version's last digits as bytes (`GAAA0014` is `0x0104`).
 
 ```python
-# Decide once per connect:
-is_v2 = (ir(1603) is not None) and (ir(1603) >= 10)
-
-# Decode every uint32 total accordingly:
 def u32(hi_reg, lo_reg):
-    return (lo_reg << 16 | hi_reg) if is_v2 else (hi_reg << 16 | lo_reg)
+    return hi_reg << 16 | lo_reg          # always high register first
 
-# AIO serial addresses also shift:
-aio1_serial_base = 1841 if is_v2 else 1831   # then read 5 regs
+aio_serial_base = [1841, 1846, 1851]       # then read 5 regs each
 ```
 
-**This simulator emits V1 only** (`IR(1603) = 9`), but ship the V2 path — real hardware
-on `GA000010+` firmware needs it.
+This simulator emits exactly that, with version `GAAA0014`.
 
 ---
 
@@ -396,10 +395,10 @@ cargo run -p sim-api -- simulate --inverter Gateway12kW --batteries 1 --soc 65 \
 What you will observe (confirmed via live Modbus query):
 
 - DTC `0x7001`, serial **`GW2423G192`** → detection classifies Gateway ✓
-- Version `GA000009`, **IR(1603)=9 → V1** ✓
+- Version `GAAA0014` (IR(1603) = `0x0104`) ✓
 - `parallel_aio_num = 1`, `aio1_soc` tracks the battery, `aio2/aio3` = 0 ✓
 - `aio1_serial = SA24230001` round-trips; AIO2/AIO3 serials empty ✓
-- Energy totals use V1 (high-register-first) byte order ✓
+- Energy totals use high-register-first byte order ✓
 - Battery power uses GE sign convention (+ discharge / − charge) ✓
 - `p_load` excludes the (unmodelled) EV charger ✓
 
@@ -407,7 +406,6 @@ What you will observe (confirmed via live Modbus query):
 
 - **Topology B (parallel AIOs) is NOT modelled** — always single-AIO. The simulator runs one plant = one gateway + one implicit AIO. To test a multi-AIO client you'd run multiple sim instances on different ports and treat them as separate IPs.
 - **No direct AIO connection** in this simulator — the single-AIO gateway projection *is* the whole plant; there's no separate AIO device to connect to. (A direct-AIO-connection code path can only be tested against real hardware or a separate AIO sim instance.)
-- **V2 firmware variant not emitted** (always V1).
 - Daily and lifetime energy registers read identically (no midnight reset).
 - Control writes behave like a normal inverter; gateway-as-authoritative-control routing is not differentiated.
 
@@ -434,7 +432,7 @@ What you will observe (confirmed via live Modbus query):
 | Where do control writes go? | **The Gateway**, always. |
 | Where does battery cell data come from? | The **AIO** (direct connection), not the Gateway. Gateway has SOC + aggregate energy only. |
 | How do I detect a Gateway? | Serial prefix `GW` on HR(13–17) (authoritative); DTC `0x7001` confirms. |
-| How do I pick V1 vs V2? | `IR(1603) >= 10` → V2 (swapped uint32 byte order + shifted serial addresses). |
+| How do I pick a layout? | You don't: there is one (high-register-first totals, serials from IR 1841). |
 | Why is my house load wrong? | You're reading the AIO's load, not the Gateway's `p_load` (IR 1618), which excludes the EV charger. |
 
 ---

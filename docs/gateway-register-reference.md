@@ -10,6 +10,16 @@
 >
 > **Status:** Phase 1 research complete. The register map is definitive; the simulation
 > build (Phase 2) is pending.
+>
+> **Correction (HEM #456, November 2026).** There is only one Gateway layout. An
+> earlier version of this document, copied from `dewet22/givenergy-modbus`
+> `select_gateway()`, described a "V2" variant chosen by `IR(1603) >= 10`. That test is
+> wrong: IR(1603) holds the last two version digits as bytes (`GAAA0014` is `0x0104`),
+> so every real Gateway is "V2" by it. GivTCP's pinned fork dropped it after its first
+> live capture. The live layout is: `uint32` totals **high register first**, and AIO
+> serials in a five-register stride from IR 1841 (aio1 1841-1845, aio2 1846-1850,
+> aio3 1851-1855). Wherever this document still shows a V1/V2 split, read it as the
+> live ("V1 order") column with the serial addresses above.
 
 ## 1. What the Gateway is
 
@@ -66,7 +76,7 @@ should agree** on a real device; a simulator must emit all three consistently.
 |---|---|---|---|
 | **Serial-number prefix** | `GW` (e.g. `GW2423G192`) | HR(13–17), 5 regs, Latin-1 | The **primary** classifier. GivTCP's detection string is built from this prefix. Standard GE serial shape: `AAYYWWANNN` → here `AA`=`GW`. |
 | **Device Type Code (DTC)** | `0x7001` | HR(0) | Family prefix `0x7xxx`. Our catalogue already maps `Gateway12kW → 0x7001`. |
-| **Firmware version string** | `GA000009` / `GA0000010` / … | IR(1600–1603) | Decoded by `gateway_version`. **Also the variant selector** (see §3). |
+| **Firmware version string** | `GA000009` / `GA0000010` / … | IR(1600–1603) | Decoded by `gateway_version`. IR(1603) is version digits, not a layout selector (§3). |
 
 **Wire addressing.** The Gateway answers transparent Modbus reads addressed to **slave
 `0x32`** for its inverter-style block (HR/IR 0–119, the standard identity + config block
@@ -83,7 +93,7 @@ GivTCP `startup.py`):
 2. Read HR(0–59) at slave `0x11`/`0x32` → identity block.
 3. Decode serial from HR(13–17); **prefix `GW` → device class Gateway**.
 4. For a Gateway, additionally read **IR(1600–1859)** (the aggregation bank) and decode
-   via the Gateway model. Firmware variant is chosen from IR(1603) at this point.
+   via the Gateway model. Do not choose a layout from IR(1603).
 5. Child AIOs (if modelling a parallel install) are discovered as *separate* TCP
    connections at their own IPs, each a normal AIO device.
 
@@ -93,30 +103,11 @@ GivTCP `startup.py`):
 > gateway bank but failing to decode `power_flow_output` from it — i.e. the bank *was*
 > being polled, the decoder was the bug.
 
-## 3. Firmware variants — V1 vs V2 (critical)
+## 3. One layout (the V1/V2 split was a mistake)
 
-There are **two Gateway firmware variants** that differ in wire encoding. A client/simulator
-**must** pick the right one or every `uint32` energy total decodes wrong by 4+ orders of
-magnitude. Source: `dewet22/givenergy-modbus` `model/gateway.py`.
-
-| Variant | Firmware | Selector | uint32 energy-total byte order | AIO serial addresses |
-|---|---|---|---|---|
-| **GatewayV1** | `GA000009` and earlier | `IR(1603) < 10` | **high register first**, then low | aio1 @ IR(1831–1835) |
-| **GatewayV2** | `GA000010` and later | `IR(1603) >= 10` | **low register first**, then high (swapped) | aio1 @ IR(1841–1845) |
-
-**Selection rule** (verbatim from `select_gateway()`):
-
-```python
-fw_raw = register_cache.get(IR(1603))
-if fw_raw is not None and fw_raw >= 10:
-    return GatewayV2   # GA000010+
-return GatewayV1       # GA000009 and earlier (also the empty-cache default)
-```
-
-**Implication for simulation:** pick one variant and emit it consistently. V1 (`GA000009`)
-is the safe default and matches the empty-cache fallback every client uses. If simulating
-V2, set IR(1603) ≥ 10 **and** use the swapped byte order **and** the shifted AIO-serial
-addresses — all three change together.
+See the correction at the top. The simulator emits one layout: version `GAAA0014`
+(`IR(1600-1603) = 0x4741 0x4141 0x0000 0x0104`), high-register-first `uint32` totals
+and AIO serials at 1841/1846/1851. Do not select a layout from IR(1603).
 
 **Validity check** (what a client uses to decide "a gateway is actually present"):
 `gateway.is_valid()` returns true iff `software_version is not None`, i.e. iff the
@@ -127,15 +118,15 @@ clients will silently ignore the gateway block.
 ## 4. Complete register map — Input Registers IR 1600–1859
 
 All gateway aggregation data is in **Input Registers** (function `0x04`). Source:
-`dewet22/givenergy-modbus` `model/gateway.py` (`_GATEWAY_COMMON_LUT` + variant LUTs),
-cross-checked against `tests/model/test_gateway.py`. "V1 order" / "V2 order" columns apply
+`dewet22/givenergy-modbus` `model/gateway.py` (`_GATEWAY_COMMON_LUT` ),
+cross-checked against `tests/model/test_gateway.py`. Any remaining "V1 order" / "V2 order" wording applies
 only to the `uint32` totals (§3).
 
 ### 4.1 System state & version — IR 1600–1631
 
 | Reg(s) | Field | Type | Scale / decode | Notes |
 |---|---|---|---|---|
-| 1600–1603 | `software_version` | str | `gateway_version` | e.g. `GA000009`. **IR(1603) is also the V1/V2 selector.** |
+| 1600–1603 | `software_version` | str | `gateway_version` | e.g. `GAAA0014`. IR(1603) is the last two digits as bytes, **not** a layout selector. |
 | 1604 | `work_mode` | enum | `WorkMode` (uint16) | See §6. |
 | 1608 | `v_grid` | float | `int16` ÷ 10 | Grid voltage, V. Range 0–500. |
 | 1609 | `i_grid` | float | `int16` ÷ 10 | Grid current, A. **Signed.** Range −500–+500. |
@@ -154,7 +145,7 @@ only to the `uint32` totals (§3).
 
 ### 4.2 Daily ("today") energy — IR 1640–1657
 
-All `÷ 10` → kWh. Identical in V1 and V2 (only the *totals* swap).
+All `÷ 10` → kWh.
 
 | Reg | Field | Meaning |
 |---|---|---|
@@ -165,22 +156,21 @@ All `÷ 10` → kWh. Identical in V1 and V2 (only the *totals* swap).
 | 1652 | `e_aio_discharge_today` | AIO battery discharge today (aggregate) |
 | 1655 | `e_load_today` | House load today (excludes EV) |
 
-### 4.3 Lifetime energy totals — IR 1641–1657 (V1/V2 byte-order swap!)
+### 4.3 Lifetime energy totals — IR 1641–1657 (high register first)
 
-`uint32`, `÷ 10` → kWh. **Register pair order differs by variant (§3).**
+`uint32`, `÷ 10` → kWh. **High register first.**
 
-| Field | V1 regs (high, low) | V2 regs (high, low) |
-|---|---|---|
-| `e_grid_import_total` | 1641, 1642 | 1642, 1641 |
-| `e_pv_total` | 1644, 1645 | 1645, 1644 |
-| `e_grid_export_total` | 1647, 1648 | 1648, 1647 |
-| `e_aio_charge_total` | 1650, 1651 | 1651, 1650 |
-| `e_aio_discharge_total` | 1653, 1654 | 1654, 1653 |
-| `e_load_total` | 1656, 1657 | 1657, 1656 |
+| Field | Regs (high, low) |
+|---|---|
+| `e_grid_import_total` | 1641, 1642 |
+| `e_pv_total` | 1644, 1645 |
+| `e_grid_export_total` | 1647, 1648 |
+| `e_aio_charge_total` | 1650, 1651 |
+| `e_aio_discharge_total` | 1653, 1654 |
+| `e_load_total` | 1656, 1657 |
 
-> Worked example (from `test_gateway_energy_totals_v1`): V1 with IR(1641)=1, IR(1642)=0
-> → `(1<<16)+0 = 65536` raw → `65536 / 10 = 6553.6 kWh`. V2 swaps the pair so the same
-> physical quantity is encoded with IR(1642) as the high word.
+> Worked example: IR(1641)=1, IR(1642)=0 → `(1<<16)+0 = 65536` raw → `6553.6 kWh`.
+> Live capture (`GAAA0014`): IR(1641)=1, IR(1642)=61291 → `126827` → `12682.7 kWh`.
 
 ### 4.4 AIO summary — IR 1700–1704
 
@@ -202,15 +192,15 @@ All `÷ 10` → kWh. Identical in V1 and V2 (only the *totals* swap).
 | 1708 | `e_aio2_charge_today` |
 | 1711 | `e_aio3_charge_today` |
 
-### 4.6 Per-AIO charge totals — IR 1706–1713 (V1/V2 swap)
+### 4.6 Per-AIO charge totals — IR 1706–1713 (high register first)
 
 `uint32`, `÷ 10` → kWh.
 
-| Field | V1 (high, low) | V2 (high, low) |
-|---|---|---|
-| `e_aio1_charge_total` | 1706, 1707 | 1707, 1706 |
-| `e_aio2_charge_total` | 1709, 1710 | 1710, 1709 |
-| `e_aio3_charge_total` | 1712, 1713 | 1713, 1712 |
+| Field | Regs (high, low) |
+|---|---|
+| `e_aio1_charge_total` | 1706, 1707 |
+| `e_aio2_charge_total` | 1709, 1710 |
+| `e_aio3_charge_total` | 1712, 1713 |
 
 ### 4.7 Per-AIO daily discharge — IR 1750–1758
 
@@ -222,24 +212,24 @@ All `÷ 10` → kWh. Identical in V1 and V2 (only the *totals* swap).
 | 1753 | `e_aio2_discharge_today` |
 | 1756 | `e_aio3_discharge_today` |
 
-### 4.8 Per-AIO discharge totals — IR 1751–1758 (V1/V2 swap)
+### 4.8 Per-AIO discharge totals — IR 1751–1758 (high register first)
 
 `uint32`, `÷ 10` → kWh.
 
-| Field | V1 (high, low) | V2 (high, low) |
-|---|---|---|
-| `e_aio1_discharge_total` | 1751, 1752 | 1752, 1751 |
-| `e_aio2_discharge_total` | 1754, 1755 | 1755, 1754 |
-| `e_aio3_discharge_total` | 1757, 1758 | 1758, 1757 |
+| Field | Regs (high, low) |
+|---|---|
+| `e_aio1_discharge_total` | 1751, 1752 |
+| `e_aio2_discharge_total` | 1754, 1755 |
+| `e_aio3_discharge_total` | 1757, 1758 |
 
 ### 4.9 Battery (aggregate) energy + per-AIO SOC — IR 1795–1803
 
 | Reg(s) | Field | Type | Notes |
 |---|---|---|---|
 | 1795 | `e_battery_charge_today` | ÷ 10 kWh | Aggregate battery charge today. |
-| 1796–1797 | `e_battery_charge_total` | uint32 ÷ 10 kWh | V1=(1796,1797); **V2 swapped=(1797,1796)**. |
+| 1796–1797 | `e_battery_charge_total` | uint32 ÷ 10 kWh | (1796,1797), high first. |
 | 1798 | `e_battery_discharge_today` | ÷ 10 kWh | Aggregate battery discharge today. |
-| 1799–1800 | `e_battery_discharge_total` | uint32 ÷ 10 kWh | V1=(1799,1800); **V2 swapped=(1800,1799)**. |
+| 1799–1800 | `e_battery_discharge_total` | uint32 ÷ 10 kWh | (1799,1800), high first. |
 | 1801 | `aio1_soc` | uint16 % | 0–100. |
 | 1802 | `aio2_soc` | uint16 % | 0–100. |
 | 1803 | `aio3_soc` | uint16 % | 0–100. |
@@ -252,22 +242,20 @@ All `÷ 10` → kWh. Identical in V1 and V2 (only the *totals* swap).
 | 1817 | `p_aio2_inverter` | int16, W (signed) |
 | 1818 | `p_aio3_inverter` | int16, W (signed) |
 
-### 4.11 AIO serial numbers — IR 1831–1849 (variant-dependent!)
+### 4.11 AIO serial numbers — IR 1841–1855
 
-5 registers each, `serial` (Latin-1). **Addresses shift between V1 and V2.**
+5 registers each, `serial` (Latin-1), a contiguous five-register stride.
 
-| Field | V1 regs | V2 regs |
-|---|---|---|
-| `aio1_serial_number` | 1831–1835 | 1841–1845 |
-| `aio2_serial_number` | 1838–1842 | 1848–1852 |
-| `aio3_serial_number` | 1845–1849 | 1855–1859 |
-
-> Note the 7-register stride per AIO (5 data + 2 gap) in both variants.
+| Field | Regs |
+|---|---|
+| `aio1_serial_number` | 1841–1845 |
+| `aio2_serial_number` | 1846–1850 |
+| `aio3_serial_number` | 1851–1855 |
 
 ### 4.12 Address ranges not in the gateway model
 
 The gaps (e.g. 1605–1607, 1613–1615, 1626, 1632–1639, 1658–1699, 1714–1749, 1759–1794,
-1804–1815, 1819–1830, 1850–1854 in V1) are **not decoded** by the reference model. A
+1804–1815, 1819–1830, 1856–1859) are **not decoded** by the reference model. A
 simulator should serve **error responses** (the `0x12`-padding shape) or zeros for reads
 into unmapped banks — *not* synthetic garbage — so bounds-checking clients behave
 correctly. (See `mock_plant.py` `_read`: present device + absent bank → error response.)
@@ -281,7 +269,7 @@ From `dewet22/givenergy-modbus` `model/register.py` (`Converter`). All multi-byt
 |---|---|---|
 | `uint16` | raw value | counts, SOC %, power (unsigned) |
 | `int16` | two's complement: `v if v<0x8000 else v-0x10000` | signed power/current (`p_ac1`, `i_grid`, `p_aio*_inverter`, `p_liberty`) |
-| `uint32(hi, lo)` | `(hi<<16) + lo` | energy totals — **hi/lo order is variant-dependent (§3)** |
+| `uint32(hi, lo)` | `(hi<<16) + lo` | energy totals — high register first |
 | `deci` | `v / 10` | V, A, kWh throughout the gateway bank |
 | `serial(r0..r4)` | concat big-endian bytes → Latin-1 string, strip `\0`, **upper-case** | serial numbers |
 | `gateway_version(r0,r1,r2,r3)` | prefix = latin1 decode of r0\|r1 bytes (strip NUL); digits = decimal string of each byte of r2,r3 → e.g. `GA` + `000009` | firmware string |
@@ -293,7 +281,7 @@ r0=0x4741 ('G','A'), r1=0x3030 ('0','0'), r2=0x0000, r3=9
 → prefix = "GA", digits = "00"+"00"+"09" = "GA000009"
 ```
 
-For V2: r3=10 → digits of byte `0x0A`=`10` → `"GA0000010"`.
+Live capture: `0x4741 0x4141 0x0000 0x0104` → `"GAAA"` + `"00"` + `"14"` = `"GAAA0014"`.
 
 **Bounds checking.** Fields declare `min`/`max` (e.g. `v_grid` 0–500, `p_pv` ≤ 50000,
 SOC 0–100). A client **suppresses to `None`** any post-conversion value outside bounds —
@@ -432,14 +420,14 @@ the gateway's slave address covering:
 | 4 | IR(1750–1758) | per-AIO discharge (daily + total) |
 | 5 | IR(1795–1803) | battery aggregate energy + per-AIO SOC |
 | 6 | IR(1816–1818) | per-AIO inverter power |
-| 7 | IR(1831–1849) (V1) *or* IR(1841–1859) (V2) | per-AIO serials |
+| 7 | IR(1841–1855) | per-AIO serials |
 
 …plus the standard identity/config block HR(0–119) read that every GE device gets on
 detect. Clients typically batch these into the fewest fc-0x04 requests the dongle will
 answer in one transaction (GivEnergy dongles prefer ≤60-register reads; large reads cause
 the timeout cascades documented in giv_tcp issue #471).
 
-A **simulator** should answer all of the above with in-bounds, variant-consistent values,
+A **simulator** should answer all of the above with in-bounds, consistent values,
 and answer any read into an unmapped sub-range with an error response (not zeros) — see
 §4.12.
 
@@ -451,14 +439,14 @@ Derived from the above. This is the Phase 2 build checklist.
    classifies the device as a Gateway. (Our current `Gateway12kW` emits a generic serial —
    the detection gap.)
 2. **Set HR(0) = 0x7001** (already done) **and** populate IR(1600–1603) with a real
-   version string (default `GA000009` → V1). Without the version string, clients treat the
+   version string (default `GAAA0014`). Without the version string, clients treat the
    gateway as absent (`is_valid() == false`).
 3. **Serve the full IR 1600–1859 aggregation bank** projected from the underlying plant
    state: grid/PV/load from a meter model, AIO power/SOC/energy summed across child
    inverters, faults as a bitmask.
 4. **Zero direct batteries** on the gateway device itself (batteries belong to child AIOs).
-5. **Honour the V1/V2 variant contract** as a single switch: byte order of all `uint32`
-   totals *and* the AIO-serial addresses change together, gated on IR(1603).
+5. **Emit the one live layout:** high-register-first `uint32` totals and AIO serials
+   from IR 1841. IR(1603) is version digits, not a layout selector.
 6. **Keep schedule and battery config writes on the gateway** (`GATEWAY_OWN_HOLDING`):
    they read back from the gateway but do not drive the AIO (see §1).
 7. **Exclude EV-charger power from `p_load` / `e_load_*`** — the defining gateway property.
@@ -478,7 +466,7 @@ The dominant real topology (1 Gateway + 1 AIO — the case behind giv_tcp issues
 
 ## 12. Sources
 
-All register addresses, scalings, enums, and the V1/V2 split are taken from:
+All register addresses, scalings, enums, are taken from:
 
 - **`dewet22/givenergy-modbus`** (Python, Apache-2.0) — the client library used by the
   `givenergy-hass` / `givenergy-local` Home Assistant integration:

@@ -59,7 +59,7 @@ treat the **serial prefix as authoritative**:
 |---|---|---|---|---|
 | 1 | **Serial-number prefix** | HR(13–17), 5 regs, Latin-1 | `GW…` (e.g. `GW2423G192`) | **Primary classifier.** First two bytes = `'G'`,`'W'`. |
 | 2 | Device Type Code | HR(0) | `0x7001` (family `0x7xxx`) | Confirms it. |
-| 3 | Firmware version string | IR(1600–1603), `gateway_version` decode | `GA000009` / `GA000010` / … | Also the V1/V2 selector (§4). |
+| 3 | Firmware version string | IR(1600–1603), `gateway_version` decode | `GAAA0014` / … | Last digits as bytes; not a layout selector (see the correction in the register reference). |
 
 **Recommended detection flow:**
 
@@ -69,7 +69,6 @@ decode serial from HR(13–17)
 if serial.startswith("GW"):
     device_class = GATEWAY
     read IR(1600–1859)              # the aggregation bank
-    pick variant from IR(1603)      # <10 → V1, >=10 → V2
     validity = (version_string is non-empty)   # i.e. IR(1600–1603) not all zero
 else:
     device_class = <hybrid/AIO/etc.>
@@ -84,7 +83,7 @@ else:
 ## 3. The display data model — six groups
 
 The IR 1600–1859 bank decomposes into six logical groups. Map each to a UI
-region. Addresses below are V1; see §4 for V1/V2 differences.
+region. Addresses below are the live layout (§4).
 
 ### Group A — Identity & state (IR 1600–1631) → header / status badge
 
@@ -128,7 +127,7 @@ expandable list — most installs show one row.
 
 | Per AIO `n` | Charge today | Charge total | Disch today | Disch total | Inverter power | Serial |
 |---|---|---|---|---|---|---|
-| Address (V1) | 1705/1708/1711 | 1706–7/1709–10/1712–13 | 1750/1753/1756 | 1751–2/1754–5/1757–8 | 1816/1817/1818 | 1831–5/1838–42/1845–49 |
+| Address | 1705/1708/1711 | 1706–7/1709–10/1712–13 | 1750/1753/1756 | 1751–2/1754–5/1757–8 | 1816/1817/1818 | 1841–5/1846–50/1851–5 |
 
 ### Group E — Battery aggregate + per-AIO SOC (IR 1795–1803) → battery gauge
 
@@ -146,7 +145,7 @@ expandable list — most installs show one row.
 
 Daily counters (÷10 kWh) and lifetime totals (`uint32`, ÷10 kWh). Six flows:
 
-| Flow | Today | Lifetime (V1 regs) |
+| Flow | Today | Lifetime regs |
 |---|---|---|
 | Grid import | 1640 | 1641, 1642 |
 | PV generation | 1643 | 1644, 1645 |
@@ -161,32 +160,21 @@ Daily counters (÷10 kWh) and lifetime totals (`uint32`, ÷10 kWh). Six flows:
 > hardware resets "today" at local midnight. Clients that graph "today" should
 > handle the case where today == total gracefully.
 
-## 4. The V1/V2 variant trap (read this before decoding energy totals)
+## 4. One layout (there is no V1/V2 variant)
 
-There are **two firmware variants** that differ in wire encoding. Pick the wrong
-one and every `uint32` energy total decodes wrong by orders of magnitude.
-
-| Variant | Selector | uint32 byte order | AIO serial addresses |
-|---|---|---|---|
-| **V1** | `IR(1603) < 10` | **high register first**, then low | aio1 @ 1831–1835 |
-| **V2** | `IR(1603) >= 10` | **low register first**, then high (swapped) | aio1 @ 1841–1845 |
+An earlier version of this guide described a "V2" layout chosen by `IR(1603) >= 10`.
+That test is wrong: IR(1603) holds the version's last digits as bytes (`GAAA0014` is
+`0x0104`), so every real Gateway would be "V2". GivTCP's pinned library dropped the
+test after its first live capture. The one live layout:
 
 ```python
-# One-time variant decision, per connect:
-is_v2 = (ir1603 is not None) and (ir1603 >= 10)
+def u32(hi_reg, lo_reg):
+    return hi_reg << 16 | lo_reg      # high register first, always
+
+aio_serial_base = [1841, 1846, 1851]   # five registers each
 ```
 
-Then for every `uint32` total:
-
-```python
-def u32(hi_reg, lo_reg, v2=False):
-    return (lo_reg << 16 | hi_reg) if v2 else (hi_reg << 16 | lo_reg)
-```
-
-And for AIO serials, use the V1 addresses (1831+) or V2 addresses (1841+)
-accordingly. **This simulator emits V1 only** (`IR(1603) = 9`), so against this
-sim you will always take the V1 path — but ship the V2 path too or real-hardware
-users on `GA000010+` will see garbage energy graphs.
+This simulator emits exactly that (version `GAAA0014`).
 
 ## 5. Building the power-flow diagram
 
@@ -293,17 +281,15 @@ cargo run -p sim-api -- simulate --inverter Gateway12kW --batteries 1 --soc 65 \
 What you will observe (confirmed via live Modbus query):
 
 - DTC `0x7001`, serial **`GW2423G192`** → detection classifies Gateway ✓
-- Version `GA000009`, **IR(1603)=9 → V1** ✓
+- Version `GAAA0014` (IR(1603) = `0x0104`) ✓
 - `parallel_aio_num = 1`, `aio1_soc` tracks the battery, `aio2/aio3` = 0 ✓
 - `aio1_serial = SA24230001` round-trips; AIO2/AIO3 serials empty ✓
-- Energy totals use V1 (high-register-first) byte order ✓
+- Energy totals use high-register-first byte order ✓
 - Battery power uses GE sign convention (+ discharge / − charge) ✓
 - `p_load` excludes the (unmodelled) EV charger ✓
 
 **Known simulator limitations to code defensively against:**
 
-- V2 firmware variant is **not** emitted (always V1). Don't assume you'll ever
-  see `IR(1603) >= 10` here — but your client must still handle it.
 - Daily and lifetime energy registers read identically (no midnight reset).
 - Multi-AIO topology (2–3 AIOs) is not modelled — always single-AIO.
 - Control writes behave like a normal inverter; gateway-as-authoritative-control

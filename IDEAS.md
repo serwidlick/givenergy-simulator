@@ -88,16 +88,13 @@ Gateway devices (DTC prefix `0x7xxx`) aggregate data from All-in-One inverters.
 **Implemented as a single-AIO projection model** (v0.16.0): when `inverter_type`
 starts with `Gateway`, the `PlantState` models the child AIO's physics and
 `project_gateway_bank()` derives the IR 1600–1859 aggregation bank + `GW` serial
-prefix from that state. Detection (`GW` serial), version/variant (V1
-`GA000009`), work mode, AIO summary, per-AIO power/SOC/serials, energy totals,
+prefix from that state. Detection (`GW` serial), version (`GAAA0014`), work mode, AIO summary, per-AIO power/SOC/serials, energy totals,
 and the EV-excluded `p_load` are all served. See
 `docs/gateway-register-reference.md` for the authoritative register map.
 
 **Remaining work (Phase 2+):**
 
 - Multi-AIO topology (2–3 AIOs) — currently single-AIO only.
-- Firmware variant **V2** (`GA000010+`): swapped `uint32` byte order + shifted
-  AIO serial addresses, gated by a config knob. Currently V1-only.
 - Control-write routing (charge/discharge enable, SOC target) currently behaves
   like a normal inverter; gateway-as-authoritative-control-endpoint semantics
   need explicit handling for parallel installs.

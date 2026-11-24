@@ -2128,12 +2128,12 @@ impl RegisterStore {
     /// method derives the gateway's measured/aggregated view of it. See
     /// `docs/gateway-register-reference.md` for the authoritative register map.
     ///
-    /// Firmware variant selection:
-    /// - V1 (`GA000009`, IR(1603) < 10): high-register-first uint32 totals,
-    ///   aio1 serial @ 1831-1835, aio2 @ 1838-1842, aio3 @ 1845-1849.
-    /// - V2 (`GA000010`, IR(1603) >= 10): low-register-first uint32 totals,
-    ///   aio1 serial @ 1841-1845, aio2 @ 1848-1852, aio3 @ 1855-1859.
-    ///   Controlled by `state.config.gateway_fw_version` (default 9 = V1).
+    /// Layout (matches the live Gateway, GivTCP's pinned library and HEM):
+    /// - Version `GAAA0014` (IR(1603) = 0x0104: digits as bytes, so >= 10
+    ///   means nothing about the layout).
+    /// - uint32 totals are high-register-first.
+    /// - AIO serials in a five-register stride from IR 1841: aio1 1841-1845,
+    ///   aio2 1846-1850, aio3 1851-1855.
     fn project_gateway_bank(&mut self, state: &sim_models::PlantState) {
         if !is_gateway_inverter(&state.config.inverter_type) {
             return;
@@ -2145,14 +2145,12 @@ impl RegisterStore {
         let deci = |eng: f64| -> u16 { (eng * 10.0).round().clamp(0.0, 65535.0) as u16 };
         let i16_word = |watts: f64| -> u16 { watts.clamp(-32768.0, 32767.0) as i16 as u16 };
         let u16_word = |w: f64| -> u16 { w.round().clamp(0.0, 65535.0) as u16 };
-        let is_v2 = state.config.gateway_fw_version >= 10;
-        // uint32: byte order depends on variant.
-        // V1: high-register-first (hi, lo). V2: low-register-first (lo, hi).
+        // uint32 totals: high register first.
         let u32_words = |engineering: f64, scaling: f64| -> (u16, u16) {
             let raw = (engineering / scaling).max(0.0).round() as u32;
             let hi = (raw >> 16) as u16;
             let lo = (raw & 0xFFFF) as u16;
-            if is_v2 { (lo, hi) } else { (hi, lo) }
+            (hi, lo)
         };
         let mut set = |addr: u16, v: u16| {
             self.values.insert(addr as u32, v);
@@ -2187,16 +2185,13 @@ impl RegisterStore {
         let et = &state.energy_totals;
 
         // 4.1 System state & version — IR 1600-1631 ----------------------
-        // software_version = "GA000009" (V1) or "GA0000010" (V2).
-        // gateway_version converter:
-        //   prefix = latin1(r0|r1) = "GA00", digits = decimal of each byte of
-        //   r2|r3 → e.g. "00"+"09" → "GA000009" (V1) or "00"+"10" → "GA0000010" (V2).
-        //   IR(1603) < 10 selects V1, >= 10 selects V2.
-        let fw_byte = state.config.gateway_fw_version;
+        // software_version = "GAAA0014", as captured from a live Gateway.
+        // gateway_version converter: prefix = latin1(r0|r1) = "GAAA", digits =
+        // decimal of each byte of r2|r3 = "00" + "14".
         set(1600, (b'G' as u16) << 8 | b'A' as u16); // 0x4741
-        set(1601, (b'0' as u16) << 8 | b'0' as u16); // 0x3030
+        set(1601, (b'A' as u16) << 8 | b'A' as u16); // 0x4141
         set(1602, 0x0000);
-        set(1603, fw_byte); // < 10 = V1, >= 10 = V2
+        set(1603, 0x0104); // digits 1 and 4 as bytes
         // work_mode = On Grid (2)
         set(1604, 2);
         set(1608, deci(line_v)); // v_grid
@@ -2231,7 +2226,6 @@ impl RegisterStore {
         // Daily counters and lifetime totals both derive from the cumulative
         // energy_totals (the sim does not reset daily counters — consistent
         // with the standard IR 25/35 "today" registers).
-        // uint32 byte order depends on variant (V1 = hi-first, V2 = lo-first).
         set(1640, deci(et.grid_import_kwh)); // e_grid_import_today
         let (h, l) = u32_words(et.grid_import_kwh, 0.1);
         set(1641, h);
@@ -2286,23 +2280,9 @@ impl RegisterStore {
         let per_aio_discharge_total = battery_discharge_total / num_aio as f64;
         let soc = state.aggregate_soc(); // all AIOs share the same SoC
 
-        // V1/V2 AIO serial address bases.
-        fn aio_serial_addrs(aio_idx: usize, is_v2: bool) -> u16 {
-            if is_v2 {
-                match aio_idx {
-                    0 => 1841,
-                    1 => 1848,
-                    2 => 1855,
-                    _ => 1841,
-                }
-            } else {
-                match aio_idx {
-                    0 => 1831,
-                    1 => 1838,
-                    2 => 1845,
-                    _ => 1831,
-                }
-            }
+        // AIO serial base address: five-register stride from IR 1841.
+        fn aio_serial_addrs(aio_idx: usize) -> u16 {
+            1841 + 5 * aio_idx as u16
         }
 
         // Generate a unique 10-char Latin-1 serial for each AIO.
@@ -2379,13 +2359,13 @@ impl RegisterStore {
             set(reg, v);
         }
 
-        // 4.11 Per-AIO serial numbers — IR 1831-1859 (variant-dependent) ---
+        // 4.11 Per-AIO serial numbers — IR 1841-1855 ---
         // Clear the full range 1831-1859, then write active AIO serials.
         for addr in 1831u16..=1859 {
             set(addr, 0);
         }
         for aio_i in 0..num_aio {
-            let base = aio_serial_addrs(aio_i, is_v2);
+            let base = aio_serial_addrs(aio_i);
             let serial = make_aio_serial(aio_i);
             for i in 0..5usize {
                 let addr = base + i as u16;
@@ -7971,10 +7951,9 @@ pub fn default_register_catalogue() -> Vec<RegisterDef> {
         gw_ir_def(1816, "gw_p_aio1_inverter", 1.0),
         gw_ir_def(1817, "gw_p_aio2_inverter", 1.0),
         gw_ir_def(1818, "gw_p_aio3_inverter", 1.0),
-        // Serial address range 1831-1859 — used by both V1 and V2 at
-        // different offsets (V1: aio1@1831, aio2@1838, aio3@1845;
-        // V2: aio1@1841, aio2@1848, aio3@1855). Define all so the
-        // snapshot always has matching catalogue entries.
+        // Serial address range 1831-1859 (the block HEM polls). The live
+        // serials sit at 1841/1846/1851; the rest read as zero. Defined in full
+        // so the snapshot always has matching catalogue entries.
         gw_ir_def(1831, "gw_serial_1831", 1.0),
         gw_ir_def(1832, "gw_serial_1832", 1.0),
         gw_ir_def(1833, "gw_serial_1833", 1.0),

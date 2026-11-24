@@ -1166,12 +1166,6 @@ pub struct PlantConfig {
     /// IR 42-43 on the inverter slave (0x32/0x31).
     #[serde(default = "default_true")]
     pub ct_meter_installed: bool,
-    /// Gateway firmware version byte (IR 1603). Values < 10 select V1
-    /// (`GA000009`, high-register-first uint32, aio1 serial @ 1831-1835);
-    /// values >= 10 select V2 (`GA000010`, low-register-first uint32,
-    /// aio1 serial @ 1841-1845). Only meaningful for gateway inverters.
-    #[serde(default = "default_gateway_fw_version")]
-    pub gateway_fw_version: u16,
     /// Number of parallel AIO units behind the Gateway (1-3).
     /// Controls how the battery stack is partitioned into per-AIO registers.
     /// Only meaningful for gateway inverters.
@@ -1197,9 +1191,6 @@ fn default_disabled_hhmm() -> u16 {
 fn default_true() -> bool {
     true
 }
-fn default_gateway_fw_version() -> u16 {
-    9
-}
 fn default_parallel_aio_num() -> u16 {
     1
 }
@@ -1214,7 +1205,6 @@ impl Default for PlantConfig {
             max_ac_watts: default_max_ac_watts(),
             pv2_peak_watts: 0.0,
             ct_meter_installed: true,
-            gateway_fw_version: 9,
             parallel_aio_num: 1,
         }
     }
