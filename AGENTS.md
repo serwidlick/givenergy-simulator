@@ -60,6 +60,12 @@ ui/              — Web frontend (Vite + vanilla JS, served by Tauri on port 14
 
 ## Version
 
+**0.18.11** — The Gateway bank matches a live Gateway (home-energy-manager
+#456): one layout, version `GAAA0014` (IR(1603) = `0x0104`, digits as bytes,
+never a layout selector), `uint32` totals high register first, AIO serials in
+a five-register stride from IR 1841. `gateway_fw_version` and the V2 paths are
+gone. 629 Rust + 5/5 scenarios green.
+
 **0.18.10** — Battery serials are persisted per module (follow-up to
 home-energy-manager #476). `BatteryState.serial` (`#[serde(default)]`) is assigned once
 at user-facing plant creation (`create_plant`, Gateway stack included, and

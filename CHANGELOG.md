@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.18.11] - 2026-11-24
+
+### Fixed
+
+- The Gateway bank now matches a live Gateway (home-energy-manager #456).
+  There was never a "V2" layout: IR(1603) holds the version's last digits as
+  bytes (`GAAA0014` is `0x0104`), and GivTCP's pinned library dropped the
+  `>= 10` test after its first live capture. The simulator now reports
+  `GAAA0014`, always writes `uint32` totals high register first, and puts the
+  AIO serials in a five-register stride from IR 1841 (aio1 1841-1845, aio2
+  1846-1850, aio3 1851-1855). The old serial positions are no longer used.
+
+### Removed
+
+- `PlantConfig.gateway_fw_version` and the V2 byte-order and serial paths it
+  selected. Saved plants that still carry the field load as before.
+
+### Tests
+
+- Live version words, high-word-first totals (including a total above 65535
+  split across both words) and the new serial addresses, in
+  `sim-registers` and the protocol test.
+
+### Docs
+
+- The Gateway docs no longer describe a V1/V2 variant, and open with a
+  correction explaining why the `IR(1603) >= 10` test was wrong.
+
 ## [0.18.10] - 2026-11-15
 
 ### Fixed
