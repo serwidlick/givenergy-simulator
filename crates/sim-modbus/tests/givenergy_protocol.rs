@@ -1239,12 +1239,12 @@ async fn gateway_multi_aio_serves_3_aio_registers() {
     assert_eq!(data[3], 167, "aio2_charge_today");
     assert_eq!(data[6], 167, "aio3_charge_today");
 
-    // 5) Read AIO serials (V1: 1831-1835, 1838-1842, 1845-1849)
-    // 3 AIOs × 5 regs with 3-reg gaps (1836-1837, 1843-1844) = 19 regs
-    let resp = send_recv(&mut stream, &build_read_input_request(1831, 19)).await;
+    // 5) Read AIO serials: five-register stride from IR 1841
+    // (aio1 1841-1845, aio2 1846-1850, aio3 1851-1855) = 15 regs
+    let resp = send_recv(&mut stream, &build_read_input_request(1841, 15)).await;
     let (_, _, payload) = decode_response(&resp);
     let (_, _, data) = parse_read_payload(&payload);
-    assert_eq!(data.len(), 19);
+    assert_eq!(data.len(), 15);
 
     let decode_serial = |start: usize| -> String {
         let mut s = String::new();
@@ -1254,15 +1254,9 @@ async fn gateway_multi_aio_serves_3_aio_registers() {
         }
         s.trim().to_string()
     };
-    assert_eq!(decode_serial(0), "SA24230001", "aio1 serial at 1831-1835");
-    // Gap at 1836-1837 (data[5..7])
-    assert_eq!(data[5], 0, "gap 1836");
-    assert_eq!(data[6], 0, "gap 1837");
-    assert_eq!(decode_serial(7), "SA24230002", "aio2 serial at 1838-1842");
-    // Gap at 1843-1844 (data[12..14])
-    assert_eq!(data[12], 0, "gap 1843");
-    assert_eq!(data[13], 0, "gap 1844");
-    assert_eq!(decode_serial(14), "SA24230003", "aio3 serial at 1845-1849");
+    assert_eq!(decode_serial(0), "SA24230001", "aio1 serial at 1841-1845");
+    assert_eq!(decode_serial(5), "SA24230002", "aio2 serial at 1846-1850");
+    assert_eq!(decode_serial(10), "SA24230003", "aio3 serial at 1851-1855");
 }
 
 #[tokio::test]

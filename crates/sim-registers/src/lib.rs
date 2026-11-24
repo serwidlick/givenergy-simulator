@@ -10165,8 +10165,8 @@ mod tests {
 
         // Version string decodes to non-empty → validity check passes.
         assert_eq!(ir(1600), (b'G' as u16) << 8 | b'A' as u16);
-        // IR(1603) = 9 < 10 selects firmware variant V1.
-        assert_eq!(ir(1603), 9, "IR(1603) must select V1 (< 10)");
+        // IR(1603) = 0x0104 ("14"): the live capture's version digits.
+        assert_eq!(ir(1603), 0x0104, "IR(1603) is the last version digits");
         // Work mode = On Grid (2)
         assert_eq!(ir(1604), 2);
         // Single-AIO summary
@@ -10316,7 +10316,7 @@ mod tests {
 
     #[test]
     fn gateway_aio_serials_populated() {
-        // AIO1 serial at IR 1831-1835 must decode to a non-blank string so the
+        // AIO1 serial at IR 1841-1845 must decode to a non-blank string so the
         // client's serial validity check passes. AIO2/AIO3 stay empty (zeros).
         let s = gateway_state();
         let mut store = RegisterStore::new(default_register_catalogue());
@@ -10326,7 +10326,7 @@ mod tests {
         // Full 10-byte serial must round-trip exactly (guards against
         // byte-pairing bugs that corrupt every register after the first).
         let mut chars = Vec::new();
-        for addr in [1831, 1832, 1833, 1834, 1835] {
+        for addr in [1841, 1842, 1843, 1844, 1845] {
             let v = ir(addr);
             chars.push((v >> 8) as u8);
             chars.push((v & 0xFF) as u8);
@@ -10344,8 +10344,21 @@ mod tests {
             b"SA24230001",
             "first_inverter_serial must round-trip"
         );
-        assert_eq!(ir(1838), 0, "aio2 serial empty for single-AIO");
-        assert_eq!(ir(1845), 0, "aio3 serial empty for single-AIO");
+        for addr in 1846..=1855 {
+            assert_eq!(
+                ir(addr),
+                0,
+                "aio2/aio3 serial empty for single-AIO ({addr})"
+            );
+        }
+        // The pre-capture positions (1831/1838/1845 stride) are not used.
+        for addr in 1831..=1840 {
+            assert_eq!(
+                ir(addr),
+                0,
+                "nothing lives at the old serial address {addr}"
+            );
+        }
     }
 
     #[test]
@@ -10402,7 +10415,7 @@ mod tests {
         assert_eq!(ir(1753), 100, "aio2_discharge_today");
         assert_eq!(ir(1756), 100, "aio3_discharge_today");
 
-        // AIO serials (V1)
+        // AIO serials: five-register stride from IR 1841 (live layout)
         let aio_serial = |base: u16| -> Vec<u8> {
             let mut chars = Vec::new();
             for addr in base..base + 5 {
@@ -10412,9 +10425,9 @@ mod tests {
             }
             chars
         };
-        assert_eq!(&aio_serial(1831)[..], b"SA24230001", "aio1 serial");
-        assert_eq!(&aio_serial(1838)[..], b"SA24230002", "aio2 serial");
-        assert_eq!(&aio_serial(1845)[..], b"SA24230003", "aio3 serial");
+        assert_eq!(&aio_serial(1841)[..], b"SA24230001", "aio1 serial");
+        assert_eq!(&aio_serial(1846)[..], b"SA24230002", "aio2 serial");
+        assert_eq!(&aio_serial(1851)[..], b"SA24230003", "aio3 serial");
 
         // first_inverter_serial mirrors AIO1
         let mut first = Vec::new();
@@ -10683,118 +10696,50 @@ mod tests {
         );
     }
 
-    /// Create a gateway state with V2 firmware (GA0000010).
-    fn gateway_v2_state() -> PlantState {
-        let mut s = gateway_state();
-        s.config.gateway_fw_version = 10;
-        s
-    }
-
     #[test]
-    fn gateway_v2_version_selector() {
-        // V2: IR(1603) >= 10 selects V2 firmware variant.
-        let s = gateway_v2_state();
+    fn gateway_version_matches_the_live_capture() {
+        // Every real Gateway reports its last version digits as bytes in
+        // IR(1603): GAAA0014 is 0x0104, which is >= 10. That must not change
+        // how anything else is encoded.
+        let s = gateway_state();
         let mut store = RegisterStore::new(default_register_catalogue());
         store.project_from_state(&s);
 
         let ir = |a: u16| store.read_by_space(a, RegisterSpace::Input).unwrap_or(0);
-        assert_eq!(ir(1600), (b'G' as u16) << 8 | b'A' as u16);
-        assert_eq!(ir(1601), (b'0' as u16) << 8 | b'0' as u16);
+        assert_eq!(ir(1600), 0x4741, "'G','A'");
+        assert_eq!(ir(1601), 0x4141, "'A','A'");
         assert_eq!(ir(1602), 0x0000);
-        assert_eq!(ir(1603), 10, "IR(1603) must be >= 10 for V2");
-        // Work mode still On Grid
-        assert_eq!(ir(1604), 2);
+        assert_eq!(ir(1603), 0x0104, "digits 1 and 4 as bytes");
+        assert_eq!(ir(1604), 2, "work mode On Grid");
     }
 
     #[test]
-    fn gateway_v2_energy_totals_swapped_byte_order() {
-        // V2: uint32 energy totals are low-register-first (swapped vs V1).
-        // grid_import_kwh = 100 → raw = 1000 = 0x03E8
-        // V2: (lo=1000, hi=0) i.e. IR(1641)=1000, IR(1642)=0.
-        let s = gateway_v2_state();
+    fn gateway_lifetime_totals_are_high_register_first() {
+        // The live layout: high word first, whatever IR(1603) says.
+        // grid_import_kwh = 100 -> raw 1000: IR(1641) = 0 (hi), IR(1642) = 1000.
+        let s = gateway_state();
         let mut store = RegisterStore::new(default_register_catalogue());
         store.project_from_state(&s);
 
         let ir = |a: u16| store.read_by_space(a, RegisterSpace::Input).unwrap_or(0);
-        // Daily counters are unchanged in V2
         assert_eq!(ir(1640), 1000, "e_grid_import_today = 100kWh * 10");
-        // V2: lo word first, then hi word (SWAPPED vs V1)
-        assert_eq!(ir(1641), 1000, "V2: e_grid_import_total_lo first");
-        assert_eq!(ir(1642), 0, "V2: e_grid_import_total_hi second");
-        // AIO1 charge total also swapped
-        assert_eq!(ir(1705), 500, "e_aio1_charge_today unchanged");
-        assert_eq!(ir(1706), 500, "V2: e_aio1_charge_total_lo first");
-        assert_eq!(ir(1707), 0, "V2: e_aio1_charge_total_hi second");
-        // Battery energy totals also swapped
-        assert_eq!(ir(1796), 500, "V2: e_battery_charge_total_lo first");
-        assert_eq!(ir(1797), 0, "V2: e_battery_charge_total_hi second");
+        assert_eq!(ir(1641), 0, "e_grid_import_total_hi first");
+        assert_eq!(ir(1642), 1000, "e_grid_import_total_lo second");
+        assert_eq!(ir(1706), 0, "e_aio1_charge_total_hi first");
+        assert_eq!(ir(1707), 500, "e_aio1_charge_total_lo second");
+        assert_eq!(ir(1796), 0, "e_battery_charge_total_hi first");
+        assert_eq!(ir(1797), 500, "e_battery_charge_total_lo second");
     }
 
     #[test]
-    fn gateway_v1_energy_totals_unchanged_by_v2_code() {
-        // Regression: V1 byte order must still be hi-first (existing V1
-        // energy test passes, but this explicitly checks swapped pairs).
-        let s = gateway_state(); // V1 default (fw_version = 9)
+    fn gateway_lifetime_totals_above_65535_split_across_the_words() {
+        let mut s = gateway_state();
+        s.energy_totals.grid_import_kwh = 12682.7; // raw 126827 = 0x0001_EF6B
         let mut store = RegisterStore::new(default_register_catalogue());
         store.project_from_state(&s);
-
         let ir = |a: u16| store.read_by_space(a, RegisterSpace::Input).unwrap_or(0);
-        // V1: hi word first, lo word second
-        assert_eq!(ir(1641), 0, "V1: e_grid_import_total_hi first");
-        assert_eq!(ir(1642), 1000, "V1: e_grid_import_total_lo second");
-        // AIO1 charge total V1 order
-        assert_eq!(ir(1706), 0, "V1: e_aio1_charge_total_hi first");
-        assert_eq!(ir(1707), 500, "V1: e_aio1_charge_total_lo second");
-        // Battery charge total V1 order
-        assert_eq!(ir(1796), 0, "V1: e_battery_charge_total_hi first");
-        assert_eq!(ir(1797), 500, "V1: e_battery_charge_total_lo second");
-    }
-
-    #[test]
-    fn gateway_v2_serial_at_v2_addresses() {
-        // V2: aio1 serial at IR 1841-1845 (not 1831-1835).
-        let s = gateway_v2_state();
-        let mut store = RegisterStore::new(default_register_catalogue());
-        store.project_from_state(&s);
-
-        let ir = |a: u16| store.read_by_space(a, RegisterSpace::Input).unwrap_or(0);
-        // V2 aio1 serial at 1841-1845
-        let mut chars = Vec::new();
-        for addr in [1841, 1842, 1843, 1844, 1845] {
-            let v = ir(addr);
-            chars.push((v >> 8) as u8);
-            chars.push((v & 0xFF) as u8);
-        }
-        assert_eq!(&chars[..], b"SA24230001", "V2 aio1 serial at 1841-1845");
-        // V1 address 1831-1835 must be zero
-        for addr in [1831, 1832, 1833, 1834, 1835] {
-            assert_eq!(ir(addr), 0, "V2: V1 serial addr {addr} must be zero");
-        }
-        // first_inverter_serial (1627-1631) mirrors aio1 regardless of variant
-        let mut first = Vec::new();
-        for addr in [1627, 1628, 1629, 1630, 1631] {
-            let v = ir(addr);
-            first.push((v >> 8) as u8);
-            first.push((v & 0xFF) as u8);
-        }
-        assert_eq!(
-            &first[..],
-            b"SA24230001",
-            "first_inverter_serial must round-trip (V2)"
-        );
-    }
-
-    #[test]
-    fn gateway_v2_snapshot_includes_bank() {
-        // Same snapshot length test for V2 variant.
-        let s = gateway_v2_state();
-        let mut store = RegisterStore::new(default_register_catalogue());
-        store.project_from_state(&s);
-        assert_eq!(
-            store.snapshot().len(),
-            default_register_catalogue().len(),
-            "every projected V2 gateway value must have a catalogue def"
-        );
+        assert_eq!(ir(1641), 1, "high word");
+        assert_eq!(ir(1642), 61291, "low word");
     }
 
     // ================================================================
