@@ -723,7 +723,38 @@ impl Default for InverterState {
     }
 }
 
-/// Battery state snapshot.
+/// Most cells any simulated module reports: the LV BMS serves 16, the HV
+/// BMU 24. A cell index at or above this is refused by
+/// [`BatteryState::set_cell_override`].
+pub const MAX_CELLS_PER_MODULE: usize = 24;
+/// Clamp range for an overridden cell voltage (volts).
+pub const CELL_OVERRIDE_MAX_VOLTS: f64 = 5.0;
+/// Clamp range for an overridden cell temperature (°C).
+pub const CELL_OVERRIDE_MIN_TEMP_C: f64 = -40.0;
+pub const CELL_OVERRIDE_MAX_TEMP_C: f64 = 150.0;
+
+/// A pinned reading for one cell of a module, used to inject a weak or hot
+/// cell into the BMS/BMU register projection (LV BMS IR 60-79/103-104, HV
+/// BMU IR 60-83/90-113). Only the wire data is affected: the module's
+/// physics (pack voltage, SOC, power) are untouched. `None` = that reading
+/// follows the module as usual.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct CellOverride {
+    /// Cell voltage in volts (projected as milli V).
+    #[serde(default)]
+    pub voltage_v: Option<f64>,
+    /// Cell temperature in °C (projected as deci °C).
+    #[serde(default)]
+    pub temperature_celsius: Option<f64>,
+}
+
+impl CellOverride {
+    /// True when neither reading is pinned.
+    pub fn is_empty(&self) -> bool {
+        self.voltage_v.is_none() && self.temperature_celsius.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatteryState {
     /// State of charge 0.0–100.0.
@@ -770,6 +801,12 @@ pub struct BatteryState {
     /// the positional `BAT0000001`, `BAT0000002`, ...
     #[serde(default)]
     pub serial: String,
+    /// Per-cell overrides keyed by 0-based cell index (`weak cell`
+    /// injection). Only the register projection reads them; see
+    /// [`CellOverride`]. Empty for every plant unless set via
+    /// `Command::SetCellOverride`, the GUI or `--cell-override`.
+    #[serde(default)]
+    pub cell_overrides: std::collections::BTreeMap<usize, CellOverride>,
 }
 
 // ---------------------------------------------------------------------------
@@ -919,6 +956,46 @@ impl BatteryState {
         self.max_charge_kw = limit_kw;
         self.max_discharge_kw = limit_kw;
     }
+
+    /// Pin (or release) one cell's reported voltage and/or temperature.
+    ///
+    /// Values are clamped to `[0, CELL_OVERRIDE_MAX_VOLTS]` V and
+    /// `[CELL_OVERRIDE_MIN_TEMP_C, CELL_OVERRIDE_MAX_TEMP_C]` °C; NaN counts
+    /// as `None`. Both `None` removes the cell's entry. A `cell` at or above
+    /// [`MAX_CELLS_PER_MODULE`] is ignored.
+    pub fn set_cell_override(
+        &mut self,
+        cell: usize,
+        voltage_v: Option<f64>,
+        temperature_celsius: Option<f64>,
+    ) {
+        if cell >= MAX_CELLS_PER_MODULE {
+            return;
+        }
+        let o = CellOverride {
+            voltage_v: voltage_v
+                .filter(|v| v.is_finite())
+                .map(|v| v.clamp(0.0, CELL_OVERRIDE_MAX_VOLTS)),
+            temperature_celsius: temperature_celsius
+                .filter(|t| t.is_finite())
+                .map(|t| t.clamp(CELL_OVERRIDE_MIN_TEMP_C, CELL_OVERRIDE_MAX_TEMP_C)),
+        };
+        if o.is_empty() {
+            self.cell_overrides.remove(&cell);
+        } else {
+            self.cell_overrides.insert(cell, o);
+        }
+    }
+
+    /// The override for `cell`, if any.
+    pub fn cell_override(&self, cell: usize) -> Option<&CellOverride> {
+        self.cell_overrides.get(&cell)
+    }
+
+    /// Remove every cell override on this module.
+    pub fn clear_cell_overrides(&mut self) {
+        self.cell_overrides.clear();
+    }
 }
 
 impl Default for BatteryState {
@@ -941,6 +1018,7 @@ impl Default for BatteryState {
             voltage_v: 48.0,
             current_a: 0.0,
             serial: String::new(),
+            cell_overrides: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -3024,5 +3102,74 @@ mod tests {
                 max_ac_watts_for(inv),
             );
         }
+    }
+
+    // --- Per-cell overrides (weak cell injection) ---
+
+    #[test]
+    fn cell_override_defaults_empty_and_loads_from_old_saves() {
+        let b = BatteryState::default();
+        assert!(b.cell_overrides.is_empty());
+        // A save written before the field existed must still load.
+        let json = r#"{"soc_percent":50.0,"capacity_kwh":9.5,"nominal_capacity_kwh":9.5,
+            "max_charge_kw":3.0,"max_discharge_kw":3.0,"min_soc":4.0,"max_soc":100.0,
+            "power_kw":0.0,"charge_efficiency":0.95,"discharge_efficiency":0.95,
+            "temperature_celsius":25.0,"throughput_kwh":0.0,"soh":1.0,"cycle_count":0.0}"#;
+        let loaded: BatteryState = serde_json::from_str(json).unwrap();
+        assert!(loaded.cell_overrides.is_empty());
+    }
+
+    #[test]
+    fn cell_override_set_get_and_clear() {
+        let mut b = BatteryState::default();
+        b.set_cell_override(3, Some(2.9), None);
+        b.set_cell_override(7, None, Some(55.0));
+        assert_eq!(b.cell_override(3).unwrap().voltage_v, Some(2.9));
+        assert_eq!(b.cell_override(3).unwrap().temperature_celsius, None);
+        assert_eq!(b.cell_override(7).unwrap().temperature_celsius, Some(55.0));
+        assert!(b.cell_override(0).is_none());
+        assert_eq!(b.cell_overrides.len(), 2);
+
+        // Setting both to None removes the entry rather than leaving a blank.
+        b.set_cell_override(3, None, None);
+        assert!(b.cell_override(3).is_none());
+        assert_eq!(b.cell_overrides.len(), 1);
+
+        b.clear_cell_overrides();
+        assert!(b.cell_overrides.is_empty());
+    }
+
+    #[test]
+    fn cell_override_clamps_to_plausible_ranges() {
+        let mut b = BatteryState::default();
+        b.set_cell_override(0, Some(-1.0), Some(500.0));
+        let o = b.cell_override(0).unwrap();
+        assert_eq!(o.voltage_v, Some(0.0));
+        assert_eq!(o.temperature_celsius, Some(CELL_OVERRIDE_MAX_TEMP_C));
+        b.set_cell_override(1, Some(99.0), Some(-200.0));
+        let o = b.cell_override(1).unwrap();
+        assert_eq!(o.voltage_v, Some(CELL_OVERRIDE_MAX_VOLTS));
+        assert_eq!(o.temperature_celsius, Some(CELL_OVERRIDE_MIN_TEMP_C));
+        // NaN is ignored (treated as "not set").
+        b.set_cell_override(2, Some(f64::NAN), Some(f64::NAN));
+        assert!(b.cell_override(2).is_none());
+    }
+
+    #[test]
+    fn cell_override_rejects_out_of_range_cell_index() {
+        let mut b = BatteryState::default();
+        b.set_cell_override(MAX_CELLS_PER_MODULE, Some(2.9), None);
+        assert!(b.cell_overrides.is_empty());
+        b.set_cell_override(MAX_CELLS_PER_MODULE - 1, Some(2.9), None);
+        assert_eq!(b.cell_overrides.len(), 1);
+    }
+
+    #[test]
+    fn cell_override_round_trips_through_serde() {
+        let mut b = BatteryState::default();
+        b.set_cell_override(5, Some(3.0), Some(48.5));
+        let json = serde_json::to_string(&b).unwrap();
+        let back: BatteryState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.cell_override(5), b.cell_override(5));
     }
 }

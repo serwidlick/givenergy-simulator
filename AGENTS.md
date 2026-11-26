@@ -387,6 +387,24 @@ needs 1 BCU + 5 BMU = **6 IR(60,60) reads per cycle**. Projectors:
 If battery data comes back empty for an HV inverter, the cluster path (not the LV
 `0x32` path) is what needs serving — this was the original gap.
 
+### Per-cell overrides (weak cell injection) are wire-only
+
+`BatteryState.cell_overrides` (`BTreeMap<usize, CellOverride>`, 0-based
+cell, persisted with `#[serde(default)]`) pins one cell's reported voltage
+and/or temperature. Only the projectors read it: `project_battery_bms`
+(IR 60-75 voltages, IR 76-79 group temps — four cells per sensor — and
+IR 103/104 `t_max`/`t_min`) and `project_battery_bmu` (IR 60-83 voltages,
+IR 90-113 per-cell temps). `BatteryEngine` never looks at it, so pack
+voltage, SOC and power are unchanged — do not "fix" that by feeding it into
+the physics. Set it only through `BatteryState::set_cell_override` (clamps
+to 0-5 V / -40-150 °C, drops NaN, refuses cell ≥ `MAX_CELLS_PER_MODULE` =
+24, removes the entry when both are `None`); the engine command
+(`SetCellOverride` / `ClearCellOverrides`), the Tauri helpers
+(`apply_cell_override` / `apply_clear_cell_overrides`) and the CLI
+(`apply_cell_overrides`, `--cell-override M:C:V[:T]`, 1-based on the
+command line) all go through it. The GUI shows the pins from
+`BatteryModuleDto.cell_overrides` and counts them itself for the badge.
+
 ### Battery serials are persisted per module
 
 `BatteryState.serial` is the module's identity on the wire (LV BMS IR

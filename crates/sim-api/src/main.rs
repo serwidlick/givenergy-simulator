@@ -239,6 +239,14 @@ enum Commands {
         /// threshold). Omit to let the thermal model vary it with load.
         #[arg(long)]
         inverter_temperature: Option<f64>,
+        /// Inject a weak/hot cell: pin one cell's reported voltage and/or
+        /// temperature as MODULE:CELL:VOLTS[:CELSIUS] (1-based module and
+        /// cell; `-` for VOLTS pins only the temperature, e.g. `1:4:2.9`,
+        /// `2:16:-:55`). Repeatable. Affects the LV BMS (IR 60-79, 103-104)
+        /// and HV BMU (IR 60-83, 90-113) cell registers only; the module's
+        /// pack voltage, SOC and power are unchanged.
+        #[arg(long = "cell-override", value_name = "MODULE:CELL:VOLTS[:CELSIUS]")]
+        cell_override: Vec<String>,
         /// Enable the GivEVC wallbox and serve it on the EVC Modbus port
         /// (--evc-port, default 5020). The wallbox stays Idle until you also
         /// plug the cable (--evc-cable) and start a charge (--evc-start).
@@ -398,6 +406,65 @@ fn configure_inverter(state: &mut PlantState, inv_type: &str) {
     // See `sim_models::default_export_limit_w_for` for the source.
     state.inverter.export_limit_w = sim_models::default_export_limit_w_for(inv_type);
     state.inverter.dsp_firmware_version = sim_models::dsp_firmware_for_inverter(inv_type);
+}
+
+/// Parse one `--cell-override` value, `MODULE:CELL:VOLTS[:CELSIUS]`, with
+/// 1-based module (1-6) and cell (1-24) on the command line. `-` for VOLTS
+/// pins only the temperature. Returns 0-based `(module, cell, volts, celsius)`.
+fn parse_cell_override(s: &str) -> Result<(usize, usize, Option<f64>, Option<f64>), String> {
+    let usage = || format!("--cell-override {s:?}: expected MODULE:CELL:VOLTS[:CELSIUS]");
+    let parts: Vec<&str> = s.split(':').map(str::trim).collect();
+    if parts.len() < 3 || parts.len() > 4 {
+        return Err(usage());
+    }
+    let module: usize = parts[0].parse().map_err(|_| usage())?;
+    let cell: usize = parts[1].parse().map_err(|_| usage())?;
+    if !(1..=6).contains(&module) {
+        return Err(format!(
+            "--cell-override {s:?}: module must be 1-6, got {module}"
+        ));
+    }
+    if !(1..=sim_models::MAX_CELLS_PER_MODULE).contains(&cell) {
+        return Err(format!(
+            "--cell-override {s:?}: cell must be 1-{}, got {cell}",
+            sim_models::MAX_CELLS_PER_MODULE
+        ));
+    }
+    let volts = match parts[2] {
+        "-" => None,
+        v => Some(v.parse::<f64>().map_err(|_| usage())?),
+    };
+    let celsius = match parts.get(3) {
+        None | Some(&"-") => None,
+        Some(t) => Some(t.parse::<f64>().map_err(|_| usage())?),
+    };
+    if volts.is_none() && celsius.is_none() {
+        return Err(format!(
+            "--cell-override {s:?}: give a voltage, a temperature or both"
+        ));
+    }
+    Ok((module - 1, cell - 1, volts, celsius))
+}
+
+/// Apply every `--cell-override` to `state`. A module the plant does not
+/// have is an error (the flag would otherwise silently do nothing).
+fn apply_cell_overrides(
+    state: &mut PlantState,
+    specs: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let count = state.batteries.len();
+    for spec in specs {
+        let (module, cell, volts, celsius) = parse_cell_override(spec)?;
+        let b = state.batteries.get_mut(module).ok_or_else(|| {
+            format!(
+                "--cell-override {spec:?}: module {} does not exist (plant has {count})",
+                module + 1
+            )
+        })?;
+        b.set_cell_override(cell, volts, celsius);
+    }
+    state.sync_battery_from_vec();
+    Ok(())
 }
 
 fn parse_weather(s: &str) -> WeatherCondition {
@@ -632,6 +699,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             fast,
             dongle_misbehaviour,
             inverter_temperature,
+            cell_override,
             evc_enabled,
             evc_cable,
             evc_start,
@@ -658,6 +726,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fast,
                 &dongle_misbehaviour,
                 inverter_temperature,
+                &cell_override,
                 evc_enabled,
                 evc_cable,
                 evc_start,
@@ -815,6 +884,7 @@ async fn simulate(
     fast: bool,
     dongle_misbehaviour: &str,
     inverter_temperature: Option<f64>,
+    cell_overrides: &[String],
     evc_enabled: bool,
     evc_cable: bool,
     evc_start: bool,
@@ -862,6 +932,9 @@ async fn simulate(
         state.inverter.temperature_override = Some(t);
         state.inverter.temperature_celsius = t.clamp(-10.0, 80.0);
     }
+
+    // Pin weak/hot cells if requested (wire-only, see --cell-override).
+    apply_cell_overrides(&mut state, cell_overrides)?;
 
     // Configure the GivEVC wallbox from CLI flags. The EVC Modbus server
     // (started below) shares this state; EvcEngine advances the state
@@ -962,6 +1035,19 @@ async fn simulate(
     tracing::info!("  Tick interval:  {tick_interval}s");
     if let Some(t) = inverter_temperature {
         tracing::info!("  Inv temp:       {t:.0}°C (pinned, thermal model off)");
+    }
+    for (m, b) in engine.state.batteries.iter().enumerate() {
+        for (cell, o) in &b.cell_overrides {
+            let v = o.voltage_v.map_or("-".to_string(), |v| format!("{v:.3} V"));
+            let t = o
+                .temperature_celsius
+                .map_or("-".to_string(), |t| format!("{t:.1} °C"));
+            tracing::info!(
+                "  Cell override:  module {} cell {} → {v}, {t}",
+                m + 1,
+                cell + 1
+            );
+        }
     }
     if evc_enabled {
         tracing::info!(
@@ -1806,6 +1892,79 @@ fn apply_schedule_updates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_cell_override_accepts_volts_temp_and_dash() {
+        // module:cell are 1-based on the command line, 0-based inside.
+        assert_eq!(
+            parse_cell_override("1:4:2.9").unwrap(),
+            (0, 3, Some(2.9), None)
+        );
+        assert_eq!(
+            parse_cell_override("2:16:2.95:55").unwrap(),
+            (1, 15, Some(2.95), Some(55.0))
+        );
+        assert_eq!(
+            parse_cell_override("1:1:-:60.5").unwrap(),
+            (0, 0, None, Some(60.5))
+        );
+        assert_eq!(
+            parse_cell_override(" 1 : 2 : 3.0 ").unwrap(),
+            (0, 1, Some(3.0), None)
+        );
+    }
+
+    #[test]
+    fn parse_cell_override_rejects_malformed_input() {
+        for bad in [
+            "",
+            "1",
+            "1:2",
+            "1:2:-",
+            "1:2:-:-",
+            "0:2:2.9",
+            "1:0:2.9",
+            "1:25:2.9",
+            "7:1:2.9",
+            "a:2:2.9",
+            "1:2:x",
+            "1:2:2.9:y",
+            "1:2:2.9:50:1",
+        ] {
+            assert!(
+                parse_cell_override(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_cell_overrides_pins_cells_on_the_requested_modules() {
+        let ts = NaiveDate::from_ymd_opt(2025, 6, 21)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let mut state = PlantState::with_battery_count(ts, 2);
+        apply_cell_overrides(&mut state, &["2:4:2.9".to_string(), "1:1:-:55".to_string()]).unwrap();
+        assert_eq!(
+            state.batteries[1].cell_override(3).unwrap().voltage_v,
+            Some(2.9)
+        );
+        assert_eq!(
+            state.batteries[0]
+                .cell_override(0)
+                .unwrap()
+                .temperature_celsius,
+            Some(55.0)
+        );
+        assert_eq!(
+            state.battery.cell_override(0).unwrap().temperature_celsius,
+            Some(55.0)
+        );
+        // A module beyond the plant is an error, not a silent drop.
+        let err = apply_cell_overrides(&mut state, &["3:1:2.9".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("module 3"), "{err}");
+    }
 
     #[test]
     fn simulate_batteries_default_to_a_new_pack() {

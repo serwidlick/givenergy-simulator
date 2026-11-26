@@ -1754,6 +1754,112 @@ pub async fn set_inverter_temperature(
 }
 
 // ---------------------------------------------------------------------------
+// Per-cell overrides (weak cell injection)
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+pub struct SetCellOverrideParams {
+    /// 0-based module index.
+    pub module: usize,
+    /// 0-based cell index (LV BMS serves 16 cells, HV BMU 24).
+    pub cell: usize,
+    /// Pinned cell voltage in volts; `None` leaves it to the model.
+    #[serde(default)]
+    pub voltage_v: Option<f64>,
+    /// Pinned cell temperature in °C; `None` leaves it to the model.
+    #[serde(default)]
+    pub temperature_celsius: Option<f64>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct ClearCellOverridesParams {
+    /// 0-based module index, or `None` for every module.
+    #[serde(default)]
+    pub module: Option<usize>,
+}
+
+/// Pin (or, with both readings `None`, release) one cell on one module.
+/// Mirrors `Command::SetCellOverride`; wire-only, physics untouched.
+pub fn apply_cell_override(
+    state: &mut sim_models::PlantState,
+    params: &SetCellOverrideParams,
+) -> Result<(), String> {
+    if params.cell >= sim_models::MAX_CELLS_PER_MODULE {
+        return Err(format!(
+            "Cell {} does not exist (cells are 1-{})",
+            params.cell + 1,
+            sim_models::MAX_CELLS_PER_MODULE
+        ));
+    }
+    let b = state
+        .batteries
+        .get_mut(params.module)
+        .ok_or_else(|| format!("Battery module {} does not exist", params.module + 1))?;
+    b.set_cell_override(params.cell, params.voltage_v, params.temperature_celsius);
+    state.sync_battery_from_vec();
+    Ok(())
+}
+
+/// Remove the cell overrides of one module (`Some`) or of every module.
+pub fn apply_clear_cell_overrides(
+    state: &mut sim_models::PlantState,
+    module: Option<usize>,
+) -> Result<(), String> {
+    match module {
+        Some(m) => {
+            let b = state
+                .batteries
+                .get_mut(m)
+                .ok_or_else(|| format!("Battery module {} does not exist", m + 1))?;
+            b.clear_cell_overrides();
+        }
+        None => {
+            for b in &mut state.batteries {
+                b.clear_cell_overrides();
+            }
+        }
+    }
+    state.sync_battery_from_vec();
+    Ok(())
+}
+
+/// Inject a weak/hot cell: pin one cell's reported voltage and/or
+/// temperature on the LV BMS (IR 60-79, 103-104) and HV BMU (IR 60-83,
+/// 90-113) projections. Both readings `null` release the cell.
+#[tauri::command]
+pub async fn set_cell_override(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    params: SetCellOverrideParams,
+) -> Result<PlantStateDto, String> {
+    let mut eng = state.engine.lock().await;
+    let e = eng
+        .as_mut()
+        .ok_or_else(|| "No plant exists — create or load a plant first".to_string())?;
+    apply_cell_override(&mut e.state, &params)?;
+    let dto = PlantStateDto::from(&e.state);
+    let _ = app.emit("state_changed", &dto);
+    Ok(dto)
+}
+
+/// Release every cell override on one module (`module`) or all modules.
+#[tauri::command]
+pub async fn clear_cell_overrides(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    params: ClearCellOverridesParams,
+) -> Result<PlantStateDto, String> {
+    let mut eng = state.engine.lock().await;
+    let e = eng
+        .as_mut()
+        .ok_or_else(|| "No plant exists — create or load a plant first".to_string())?;
+    apply_clear_cell_overrides(&mut e.state, params.module)?;
+    let dto = PlantStateDto::from(&e.state);
+    let _ = app.emit("state_changed", &dto);
+    Ok(dto)
+}
+
+// ---------------------------------------------------------------------------
 // Grid port max power output
 // ---------------------------------------------------------------------------
 
@@ -1991,6 +2097,13 @@ pub async fn set_grid_export_limit(state: State<'_, AppState>, watts: f64) -> Re
 mod tests {
     use super::*;
 
+    fn ts() -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2025, 6, 1)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+    }
+
     #[test]
     fn create_plant_defaults_to_ac_coupled_with_two_8_2_kwh_modules() {
         // The default plant (no params supplied) is an AC Coupled 0x3001
@@ -2004,6 +2117,82 @@ mod tests {
             assert_eq!(m.capacity_kwh, 8.2);
             assert_eq!(m.soh, 1.0);
         }
+    }
+
+    #[test]
+    fn apply_cell_override_pins_and_releases_a_cell() {
+        let mut state = sim_models::PlantState::with_battery_count(ts(), 2);
+        apply_cell_override(
+            &mut state,
+            &SetCellOverrideParams {
+                module: 1,
+                cell: 3,
+                voltage_v: Some(2.9),
+                temperature_celsius: Some(55.0),
+            },
+        )
+        .unwrap();
+        let o = state.batteries[1].cell_override(3).unwrap();
+        assert_eq!(o.voltage_v, Some(2.9));
+        assert_eq!(o.temperature_celsius, Some(55.0));
+        assert!(state.batteries[0].cell_overrides.is_empty());
+
+        apply_cell_override(
+            &mut state,
+            &SetCellOverrideParams {
+                module: 1,
+                cell: 3,
+                voltage_v: None,
+                temperature_celsius: None,
+            },
+        )
+        .unwrap();
+        assert!(state.batteries[1].cell_overrides.is_empty());
+    }
+
+    #[test]
+    fn apply_cell_override_rejects_bad_module_and_cell() {
+        let mut state = sim_models::PlantState::with_battery_count(ts(), 1);
+        let err = apply_cell_override(
+            &mut state,
+            &SetCellOverrideParams {
+                module: 1,
+                cell: 0,
+                voltage_v: Some(2.9),
+                temperature_celsius: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("module 2"), "{err}");
+        let err = apply_cell_override(
+            &mut state,
+            &SetCellOverrideParams {
+                module: 0,
+                cell: 24,
+                voltage_v: Some(2.9),
+                temperature_celsius: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("cell"), "{err}");
+        assert!(state.batteries[0].cell_overrides.is_empty());
+    }
+
+    #[test]
+    fn apply_clear_cell_overrides_one_module_or_all() {
+        let mut state = sim_models::PlantState::with_battery_count(ts(), 2);
+        state.batteries[0].set_cell_override(1, Some(2.9), None);
+        state.batteries[1].set_cell_override(2, Some(2.9), None);
+        state.sync_battery_from_vec();
+
+        apply_clear_cell_overrides(&mut state, Some(0)).unwrap();
+        assert!(state.batteries[0].cell_overrides.is_empty());
+        assert_eq!(state.batteries[1].cell_overrides.len(), 1);
+        assert!(apply_clear_cell_overrides(&mut state, Some(5)).is_err());
+
+        apply_clear_cell_overrides(&mut state, None).unwrap();
+        assert!(state.batteries.iter().all(|b| b.cell_overrides.is_empty()));
+        assert!(state.battery.cell_overrides.is_empty());
     }
 
     #[test]

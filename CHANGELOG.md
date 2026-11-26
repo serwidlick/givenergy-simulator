@@ -6,6 +6,52 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Per-cell override ("weak cell" injection). `BatteryState` gains a
+  persisted `cell_overrides` map (`#[serde(default)]`, 0-based cell →
+  `CellOverride { voltage_v, temperature_celsius }`) that pins one cell's
+  reported voltage and/or temperature on the wire: the LV BMS (slave
+  0x32-0x37) cell voltages IR 60-75, the cell-group temperatures IR 76-79
+  (a pinned cell shows on its group's sensor), `t_max`/`t_min` IR 103/104,
+  and the HV BMU (slave 0x50+m) cell voltages IR 60-83 and per-cell
+  temperatures IR 90-113. The module's physics (pack voltage, SOC, power,
+  module temperature) are untouched. Values clamp to 0-5 V and -40-150 °C;
+  cells 1-24 (the LV BMS ignores overrides beyond its 16 cells).
+  - `Command::SetCellOverride { module, cell, voltage_v, temperature_celsius }`
+    (both `None` releases the cell) and `Command::ClearCellOverrides { module }`
+    (`None` = every module).
+  - GUI: a "Weak Cell" row in the sidebar (module, cell, V, °C, Set/Clear),
+    the active pins listed under it with a per-cell release button, and a
+    `🔋 N weak cells` badge in the override banner. Tauri commands
+    `set_cell_override` / `clear_cell_overrides` with REST bridge routes;
+    `BatteryModuleDto.cell_overrides` lists each module's pins.
+  - CLI: `giv-sim simulate --cell-override MODULE:CELL:VOLTS[:CELSIUS]`
+    (1-based, `-` for VOLTS pins only the temperature, repeatable); a module
+    the plant does not have is an error.
+
+### Fixed
+
+- The browser GUI on :8001 now serves the on-disk `ui/index.html` in debug
+  builds even when the server's working directory is `crates/sim-tauri`
+  (as under `cargo tauri dev`), so live frontend edits no longer need a
+  Rust rebuild to reach it. Production builds keep the embedded copy.
+
+### Tests
+
+- Model: defaults, old-save loading, set/get/clear, clamping, NaN and
+  out-of-range cell handling, serde round trip. Engine: both commands
+  (module routing, `battery` mirror, missing module no-op), and a tick with
+  a pinned cell leaves SOC/voltage/power/temperature identical to one
+  without. Projection: LV BMS voltage, group temperature, `t_max`/`t_min`
+  and untouched pack registers; no-override baseline; cells beyond 16
+  ignored; HV BMU voltage and per-cell temperature with neighbours and the
+  other module unchanged. Wire: the override served on slaves 0x33 and
+  0x51 after ticking. DTO listing, Tauri helpers (bounds errors), CLI
+  parser (accept/reject tables) and `apply_cell_overrides`; 5 Playwright
+  tests (zero-based params, null voltage, validation, clear-all, list,
+  badge and per-cell release).
+
 ## [0.18.11] - 2026-11-24
 
 ### Fixed

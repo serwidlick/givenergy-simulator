@@ -2778,14 +2778,39 @@ impl RegisterStore {
         let cell_count = 16usize;
         let base_mv = battery.voltage_v * 1000.0 / cell_count as f64;
         for (i, reg) in regs.iter_mut().take(cell_count).enumerate() {
-            *reg = (base_mv * cell_voltage_factor(module_index, i)).round() as u16; // IR 60+i
+            // IR 60+i; a pinned cell (`BatteryState::cell_overrides`) wins.
+            *reg = match battery.cell_override(i).and_then(|o| o.voltage_v) {
+                Some(v) => (v * 1000.0).round() as u16,
+                None => (base_mv * cell_voltage_factor(module_index, i)).round() as u16,
+            };
         }
 
-        // Cell group temperatures: IR 76-79 (0.1 °C)
+        // Cell group temperatures: IR 76-79 (0.1 °C). Each sensor covers
+        // four cells; a pinned cell temperature shows on its group's sensor
+        // (the hottest/coldest pinned cell of the group, whichever moves
+        // furthest from the module temperature).
         let temp_deci = (battery.temperature_celsius * 10.0).round() as u16;
-        for i in 0..4 {
-            regs[16 + i] = temp_deci; // IR 76+i
+        let cell_temp_deci = |cell: usize| -> Option<u16> {
+            battery
+                .cell_override(cell)
+                .and_then(|o| o.temperature_celsius)
+                .map(|t| (t * 10.0).round().max(0.0) as u16)
+        };
+        for g in 0..4 {
+            let pinned = (g * 4..g * 4 + 4)
+                .filter_map(cell_temp_deci)
+                .max_by_key(|&t| (t as i32 - temp_deci as i32).unsigned_abs());
+            regs[16 + g] = pinned.unwrap_or(temp_deci); // IR 76+g
         }
+        let (cells_t_max, cells_t_min) = (0..cell_count).filter_map(cell_temp_deci).fold(
+            (None::<u16>, None::<u16>),
+            |(mx, mn), t| {
+                (
+                    Some(mx.map_or(t, |m| m.max(t))),
+                    Some(mn.map_or(t, |m| m.min(t))),
+                )
+            },
+        );
 
         // v_cells_sum: IR 80 (mV)
         regs[20] = (battery.voltage_v * 1000.0).round() as u16;
@@ -2843,10 +2868,11 @@ impl RegisterStore {
         regs[41] = (cap_design_ah >> 16) as u16;
         regs[42] = (cap_design_ah & 0xFFFF) as u16;
 
-        // t_max: IR 103 (0.1 °C)
-        regs[43] = temp_deci;
-        // t_min: IR 104 (0.1 °C)
-        regs[44] = (temp_deci as f64 * 0.98).round() as u16;
+        // t_max: IR 103 (0.1 °C) — a pinned hot cell raises it.
+        regs[43] = cells_t_max.map_or(temp_deci, |t| t.max(temp_deci));
+        // t_min: IR 104 (0.1 °C) — a pinned cold cell lowers it.
+        let base_t_min = (temp_deci as f64 * 0.98).round() as u16;
+        regs[44] = cells_t_min.map_or(base_t_min, |t| t.min(base_t_min));
 
         // IR 105: e_battery_discharge_total (uint16, ×0.1 kWh)
         // IR 106: e_battery_charge_total (uint16, ×0.1 kWh)
@@ -3003,14 +3029,22 @@ impl RegisterStore {
         let cell_v = 3.3 + (battery.soc_percent - 50.0) * 0.003;
         let base_mv = cell_v * 1000.0;
         for (i, reg) in regs.iter_mut().take(cells).enumerate() {
-            *reg = (base_mv * cell_voltage_factor(module_index, i)).round() as u16; // IR 60+i
+            // IR 60+i; a pinned cell (`BatteryState::cell_overrides`) wins.
+            *reg = match battery.cell_override(i).and_then(|o| o.voltage_v) {
+                Some(v) => (v * 1000.0).round() as u16,
+                None => (base_mv * cell_voltage_factor(module_index, i)).round() as u16,
+            };
         }
 
-        // IR 90-113: 24 cell temperatures (deci °C)
+        // IR 90-113: 24 cell temperatures (deci °C), per cell, so a pinned
+        // hot/cold cell shows exactly where it was injected.
         let temp_deci = (battery.temperature_celsius * 10.0).round() as u16;
         for i in 0..cells {
             if 30 + i < 60 {
-                regs[30 + i] = temp_deci; // IR 90+i
+                regs[30 + i] = match battery.cell_override(i).and_then(|o| o.temperature_celsius) {
+                    Some(t) => (t * 10.0).round().max(0.0) as u16,
+                    None => temp_deci,
+                }; // IR 90+i
             }
         }
 
@@ -9203,6 +9237,101 @@ mod tests {
         assert_eq!(bms1[40], 30); // module 1 SOC
         // Different serials (the whole of IR 110-114)
         assert_ne!(bms0[50..55], bms1[50..55], "Serials should differ");
+    }
+
+    #[test]
+    fn lv_bms_projects_weak_cell_voltage_and_temperature() {
+        let mut state = make_state();
+        state.batteries[0].voltage_v = 51.2;
+        state.batteries[0].temperature_celsius = 25.0;
+        state.sync_battery_from_vec();
+        let store = RegisterStore::new(default_register_catalogue());
+        let before = store.project_battery_bms(&state.batteries[0], 0);
+
+        // Cell 5 (IR 65) weak at 2.900 V and hot at 55.0 °C; cell 12 only cold.
+        state.batteries[0].set_cell_override(5, Some(2.9), Some(55.0));
+        state.batteries[0].set_cell_override(12, None, Some(5.0));
+        state.sync_battery_from_vec();
+        let after = store.project_battery_bms(&state.batteries[0], 0);
+
+        assert_eq!(after[5], 2900, "IR 65 carries the pinned cell voltage (mV)");
+        // Every other cell voltage is unchanged.
+        for i in (0..16).filter(|&i| i != 5) {
+            assert_eq!(after[i], before[i], "cell {i} must not move");
+        }
+        // Cell group temperatures IR 76-79: cells 4-7 form group 1, cells
+        // 12-15 group 3. The hot cell lifts its group; the cold one lowers its.
+        assert_eq!(after[16], before[16], "group 0 (cells 0-3) untouched");
+        assert_eq!(after[17], 550, "IR 77 group 1 reads the hot cell");
+        assert_eq!(after[18], before[18], "group 2 untouched");
+        assert_eq!(after[19], 50, "IR 79 group 3 reads the cold cell");
+        // t_max / t_min (IR 103/104) follow the extremes.
+        assert_eq!(after[43], 550, "IR 103 t_max is the hot cell");
+        assert_eq!(after[44], 50, "IR 104 t_min is the cold cell");
+        // Pack-level registers are untouched: SOC, cells-sum, v_out.
+        assert_eq!(after[40], before[40]);
+        assert_eq!(after[20], before[20]);
+        assert_eq!(after[22..24], before[22..24]);
+    }
+
+    #[test]
+    fn lv_bms_without_overrides_is_unchanged_and_t_min_keeps_its_offset() {
+        let state = make_state();
+        let store = RegisterStore::new(default_register_catalogue());
+        let bms = store.project_battery_bms(&state.batteries[0], 0);
+        let temp_deci = (state.batteries[0].temperature_celsius * 10.0).round() as u16;
+        assert_eq!(bms[43], temp_deci);
+        assert_eq!(bms[44], (temp_deci as f64 * 0.98).round() as u16);
+        for &group_temp in &bms[16..20] {
+            assert_eq!(group_temp, temp_deci);
+        }
+    }
+
+    #[test]
+    fn lv_bms_ignores_overrides_beyond_its_16_cells() {
+        // The HV BMU has 24 cells; a cell 16-23 override must not leak into
+        // the LV projection's other registers (IR 76+ are temperatures).
+        let mut state = make_state();
+        state.batteries[0].set_cell_override(20, Some(1.0), Some(99.0));
+        state.sync_battery_from_vec();
+        let store = RegisterStore::new(default_register_catalogue());
+        let plain = {
+            let mut p = state.clone();
+            p.batteries[0].clear_cell_overrides();
+            store.project_battery_bms(&p.batteries[0], 0)
+        };
+        let bms = store.project_battery_bms(&state.batteries[0], 0);
+        assert_eq!(bms, plain);
+    }
+
+    #[test]
+    fn hv_bmu_projects_weak_cell_voltage_and_temperature() {
+        let mut state = PlantState::with_battery_count(test_ts(), 2);
+        let store = RegisterStore::new(default_register_catalogue());
+        let before1 = store.project_battery_bmu(&state.batteries[1], 1);
+
+        state.batteries[1].set_cell_override(23, Some(2.75), Some(61.3));
+        state.sync_battery_from_vec();
+        let bmu0 = store.project_battery_bmu(&state.batteries[0], 0);
+        let bmu1 = store.project_battery_bmu(&state.batteries[1], 1);
+
+        assert_eq!(bmu1[23], 2750, "IR 83 (cell 24) pinned voltage mV");
+        assert_eq!(
+            bmu1[30 + 23],
+            613,
+            "IR 113 (cell 24) pinned temperature deci °C"
+        );
+        for i in 0..23 {
+            assert_eq!(bmu1[i], before1[i], "cell {i} voltage unchanged");
+            assert_eq!(bmu1[30 + i], before1[30 + i], "cell {i} temp unchanged");
+        }
+        // The other module is unaffected.
+        assert_eq!(bmu0, store.project_battery_bmu(&state.batteries[0], 0));
+        assert_eq!(bmu0[0], {
+            let mut p = state.clone();
+            p.batteries[0].clear_cell_overrides();
+            store.project_battery_bmu(&p.batteries[0], 0)[0]
+        });
     }
 
     // ===================================================================

@@ -81,6 +81,8 @@ pub fn run() {
             commands::set_dsp_firmware,
             commands::set_arm_firmware,
             commands::set_inverter_temperature,
+            commands::set_cell_override,
+            commands::clear_cell_overrides,
             commands::set_ct_meter,
             commands::get_grid_port_max_power,
             commands::set_grid_port_max_power,

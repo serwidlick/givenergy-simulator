@@ -40,7 +40,7 @@ const mockTauriScript = `
     return {
       soc_percent: 75.0, power_kw: 2.5, voltage_v: 51.2, current_a: 48.8,
       temperature_celsius: 28.0, capacity_kwh: 8.2, nominal_capacity_kwh: 8.2,
-      soh: 1.0, cycle_count: 12.0,
+      soh: 1.0, cycle_count: 12.0, cell_overrides: [],
     };
   }
   window.__TAURI__ = {
@@ -396,6 +396,100 @@ test('clear inverter temperature sends null', async ({ page }) => {
   const c = calls.find(x => x.cmd === 'set_inverter_temperature');
   expect(c).toBeTruthy();
   expect(p(c).celsius).toBeNull();
+});
+
+// ===== Weak cell (per-cell override) =====
+
+test('weak cell override sends zero-based module and cell with both readings', async ({ page }) => {
+  await setupPage(page);
+  await page.click('#btn-create');
+  await page.waitForTimeout(300);
+  await page.fill('#cell-override-module', '2');
+  await page.fill('#cell-override-cell', '4');
+  await page.fill('#cell-override-volts', '2.9');
+  await page.fill('#cell-override-temp', '55');
+  await page.click('#btn-apply-cell-override');
+  await page.waitForTimeout(300);
+
+  const calls = await getCalls(page);
+  const c = calls.find(x => x.cmd === 'set_cell_override');
+  expect(c).toBeTruthy();
+  expect(p(c)).toEqual({ module: 1, cell: 3, voltage_v: 2.9, temperature_celsius: 55 });
+});
+
+test('weak cell override with only a temperature sends a null voltage', async ({ page }) => {
+  await setupPage(page);
+  await page.click('#btn-create');
+  await page.waitForTimeout(300);
+  await page.fill('#cell-override-module', '1');
+  await page.fill('#cell-override-cell', '16');
+  await page.fill('#cell-override-temp', '60.5');
+  await page.click('#btn-apply-cell-override');
+  await page.waitForTimeout(300);
+
+  const calls = await getCalls(page);
+  const c = calls.find(x => x.cmd === 'set_cell_override');
+  expect(c).toBeTruthy();
+  expect(p(c)).toEqual({ module: 0, cell: 15, voltage_v: null, temperature_celsius: 60.5 });
+});
+
+test('weak cell override needs a voltage or a temperature', async ({ page }) => {
+  await setupPage(page);
+  await page.click('#btn-create');
+  await page.waitForTimeout(300);
+  await page.fill('#cell-override-module', '1');
+  await page.fill('#cell-override-cell', '3');
+  await page.click('#btn-apply-cell-override');
+  await page.waitForTimeout(300);
+
+  const calls = await getCalls(page);
+  expect(calls.find(x => x.cmd === 'set_cell_override')).toBeFalsy();
+  await expect(page.locator('#footer-info')).toContainText('voltage');
+});
+
+test('clear weak cells sends a null module (all modules)', async ({ page }) => {
+  await setupPage(page);
+  await page.click('#btn-create');
+  await page.waitForTimeout(300);
+  await page.click('#btn-clear-cell-overrides');
+  await page.waitForTimeout(300);
+
+  const calls = await getCalls(page);
+  const c = calls.find(x => x.cmd === 'clear_cell_overrides');
+  expect(c).toBeTruthy();
+  expect(p(c).module).toBeNull();
+});
+
+test('active weak cells are listed, badged and releasable', async ({ page }) => {
+  await setupPage(page);
+  await page.evaluate(() => {
+    window.__TAURI_MOCK__.createdModules = [
+      {},
+      { cell_overrides: [
+        { cell: 3, voltage_v: 2.9, temperature_celsius: null },
+        { cell: 7, voltage_v: null, temperature_celsius: 55 },
+      ] },
+    ];
+  });
+  // Before any plant the list says none are active and the badge is silent.
+  await expect(page.locator('#cell-override-list')).toContainText('none');
+  await page.click('#btn-create');
+  await page.waitForTimeout(300);
+
+  const list = page.locator('#cell-override-list');
+  await expect(list).toContainText('Module 2 cell 4');
+  await expect(list).toContainText('2.900 V');
+  await expect(list).toContainText('Module 2 cell 8');
+  await expect(list).toContainText('55.0 °C');
+  await expect(page.locator('#override-indicator')).toContainText('2 weak cell');
+
+  // Each entry's × releases just that cell (both readings null).
+  await page.click('.cell-override-release[data-module="1"][data-cell="7"]');
+  await page.waitForTimeout(300);
+  const calls = await getCalls(page);
+  const c = calls.find(x => x.cmd === 'set_cell_override');
+  expect(c).toBeTruthy();
+  expect(p(c)).toEqual({ module: 1, cell: 7, voltage_v: null, temperature_celsius: null });
 });
 
 // ===== Faults =====
