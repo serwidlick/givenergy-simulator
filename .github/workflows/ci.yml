@@ -11,11 +11,13 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  test:
+  ci:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -25,23 +27,16 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
+      # Cheap checks first so a format slip fails in seconds.
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Markdown lint
+        run: npx -y markdownlint-cli2@0.23 "**/*.md" "#**/node_modules/**" "#**/target/**"
+      - name: Clippy
+        run: cargo clippy --all-targets --workspace --exclude sim-tauri 2>&1 | (! grep -E "^error" | grep -v "Rust 2015")
       - name: Build
         run: cargo build --release --workspace --exclude sim-tauri
       - name: Unit tests
         run: cargo test --workspace --exclude sim-tauri
       - name: Scenario regression
         run: ./scripts/run-ci.sh
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - name: Format check
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --all-targets --workspace --exclude sim-tauri 2>&1 | (! grep -E "^error" | grep -v "Rust 2015")
-      - name: Markdown lint
-        run: npx -y markdownlint-cli2@0.23 "**/*.md" "#**/node_modules/**" "#**/target/**"
