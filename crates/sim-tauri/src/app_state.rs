@@ -132,6 +132,8 @@ pub struct PlantStateDto {
     /// pinned; `None` = thermal model active. Surfaced so the GUI can show
     /// the override state and offer a Clear control.
     pub inverter_temperature_override: Option<f64>,
+    /// Battery calibration stage, as HR 29 reports it (0 = off, 1-3 running, 4 = complete).
+    pub calibration_stage: u8,
     /// Live export power limit (W). Drives HR 1063 (`p_export_limit`, three-
     /// phase / HV / AIO, ×0.1 dW encoding) and HR 2071 (`ems_export_power_limit`,
     /// EMS / EmsCommercial / Gateway, raw watts). For single-phase / AC-coupled
@@ -530,6 +532,7 @@ impl From<&PlantState> for PlantStateDto {
             inverter_max_output_w: state.config.max_ac_watts,
             inverter_temperature_celsius: state.inverter.temperature_celsius,
             inverter_temperature_override: state.inverter.temperature_override,
+            calibration_stage: state.calibration.stage.as_u8(),
             export_limit_w: state.inverter.export_limit_w,
             charge_power_limit_percent: if state.battery_charge_limit_percent <= 0.0 {
                 100.0
@@ -627,6 +630,14 @@ mod tests {
         assert_eq!(o[1].cell, 3);
         assert_eq!(o[1].voltage_v, Some(2.9));
         assert_eq!(o[1].temperature_celsius, None);
+    }
+
+    #[test]
+    fn dto_exposes_calibration_stage() {
+        let mut state = PlantState::new(ts());
+        assert_eq!(PlantStateDto::from(&state).calibration_stage, 0);
+        state.calibration.stage = sim_models::CalibrationStage::HoldingFull;
+        assert_eq!(PlantStateDto::from(&state).calibration_stage, 2);
     }
 
     #[test]

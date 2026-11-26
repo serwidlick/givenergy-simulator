@@ -786,6 +786,16 @@
         <div id="schedule-display" style="font-size:12px;color:var(--text-muted)">Initialising...</div>
       </div>
 
+      <!-- Battery calibration (HR 29) -->
+      <div class="card" id="calibration-card">
+        <div class="card-label">Battery Calibration</div>
+        <div id="calibration-stage" style="font-size:12px;margin-bottom:6px">—</div>
+        <div class="row">
+          <button id="btn-start-calibration" class="btn-mini">Start</button>
+          <button id="btn-cancel-calibration" class="btn-mini" disabled>Cancel</button>
+        </div>
+      </div>
+
       <!-- Faults (hidden when empty) -->
       <div class="card" id="faults-card" style="display: none">
         <div class="card-label">Active Faults</div>
@@ -1448,6 +1458,14 @@
       el('dash-batt-discharge').innerHTML = `${fmtKwh(s.energy_totals.battery_discharge_kwh)} <span class="card-unit">kWh</span>`;
       el('dash-load-kwh').innerHTML = `${fmtKwh(s.energy_totals.load_consumption_kwh)} <span class="card-unit">kWh</span>`;
 
+      // Calibration (HR 29 stage)
+      const calStage = s.calibration_stage ?? 0;
+      const calNames = ['Off', 'Charging to 100%', 'Holding at 100%', 'Discharging to reserve', 'Complete'];
+      el('calibration-stage').textContent = `${calNames[calStage] ?? 'Unknown'} (HR 29 = ${calStage})`;
+      const calRunning = calStage >= 1 && calStage <= 3;
+      el('btn-start-calibration').disabled = calRunning;
+      el('btn-cancel-calibration').disabled = !calRunning;
+
       // Faults
       if (s.active_faults.length > 0) {
         el('faults-card').style.display = '';
@@ -1961,6 +1979,20 @@
         await sendCellOverride(module, cell, null, null);
         el('footer-info').textContent = `Module ${module + 1} cell ${cell + 1} released`;
       } catch (e) { console.error('release cell override failed:', e); }
+    });
+
+    // ---- Battery calibration ----
+    el('btn-start-calibration').addEventListener('click', async () => {
+      try {
+        await invoke('start_calibration', { params: { module: null } });
+        el('footer-info').textContent = 'Battery calibration started';
+      } catch (e) { console.error('start calibration failed:', e); }
+    });
+    el('btn-cancel-calibration').addEventListener('click', async () => {
+      try {
+        await invoke('cancel_calibration');
+        el('footer-info').textContent = 'Battery calibration cancelled';
+      } catch (e) { console.error('cancel calibration failed:', e); }
     });
 
     // ---- Dongle Misbehaviour ----

@@ -85,6 +85,7 @@ const mockTauriScript = `
             inverter_max_output_w: maxOutputW,
             inverter_temperature_celsius: 35.0,
             inverter_temperature_override: null,
+            calibration_stage: window.__TAURI_MOCK__.calibrationStage || 0,
             export_limit_w: exportLimitW,
             aggregate_soc: 75.0, battery_power_kw: 2.5, battery_temperature_celsius: 28.0,
             battery_module_count: modules.length,
@@ -490,6 +491,38 @@ test('active weak cells are listed, badged and releasable', async ({ page }) => 
   const c = calls.find(x => x.cmd === 'set_cell_override');
   expect(c).toBeTruthy();
   expect(p(c)).toEqual({ module: 1, cell: 7, voltage_v: null, temperature_celsius: null });
+});
+
+// ===== Calibration =====
+
+test('calibration card shows Off and starts a calibration', async ({ page }) => {
+  await setupPage(page);
+  await page.click('#btn-create');
+  await page.waitForTimeout(300);
+  await expect(page.locator('#calibration-stage')).toContainText('Off');
+  await expect(page.locator('#btn-cancel-calibration')).toBeDisabled();
+
+  await page.click('#btn-start-calibration');
+  await page.waitForTimeout(300);
+  const calls = await getCalls(page);
+  const start = calls.find(x => x.cmd === 'start_calibration');
+  expect(start).toBeTruthy();
+  expect(p(start).module).toBeNull();
+});
+
+test('calibration card reflects a running stage', async ({ page }) => {
+  await setupPage(page);
+  await page.evaluate(() => { window.__TAURI_MOCK__.calibrationStage = 2; });
+  await page.click('#btn-create');
+  await page.waitForTimeout(300);
+  await expect(page.locator('#calibration-stage')).toContainText('Holding at 100%');
+  await expect(page.locator('#calibration-stage')).toContainText('HR 29 = 2');
+  await expect(page.locator('#btn-start-calibration')).toBeDisabled();
+  await expect(page.locator('#btn-cancel-calibration')).toBeEnabled();
+  await page.click('#btn-cancel-calibration');
+  await page.waitForTimeout(300);
+  const calls = await getCalls(page);
+  expect(calls.find(x => x.cmd === 'cancel_calibration')).toBeTruthy();
 });
 
 // ===== Faults =====
