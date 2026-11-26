@@ -84,6 +84,16 @@ pub enum Command {
     ClearCellOverrides {
         module: Option<usize>,
     },
+    /// Set HV BMS alarm words on a module (`None` keeps a word): the
+    /// stack's BCU warning/protection/fault (IR 114-119, read from the
+    /// stack's first module) and the module's BMU fault word (IR 122-123).
+    SetHvFaultWords {
+        module: usize,
+        bcu_warning: Option<u32>,
+        bcu_protection: Option<u32>,
+        bcu_fault: Option<u32>,
+        bmu_fault: Option<u32>,
+    },
     SetSimulationTime(NaiveDateTime),
     /// Enable/disable EMS (Energy Management System) control mode.
     SetEmsEnable(bool),
@@ -291,6 +301,22 @@ impl SimulationEngine {
                         }
                     }
                     self.state.sync_battery_from_vec();
+                }
+                Command::SetHvFaultWords {
+                    module,
+                    bcu_warning,
+                    bcu_protection,
+                    bcu_fault,
+                    bmu_fault,
+                } => {
+                    if let Some(b) = self.state.batteries.get_mut(module) {
+                        let f = &mut b.hv_faults;
+                        f.bcu_warning = bcu_warning.unwrap_or(f.bcu_warning);
+                        f.bcu_protection = bcu_protection.unwrap_or(f.bcu_protection);
+                        f.bcu_fault = bcu_fault.unwrap_or(f.bcu_fault);
+                        f.bmu_fault = bmu_fault.unwrap_or(f.bmu_fault);
+                        self.state.sync_battery_from_vec();
+                    }
                 }
                 Command::SetBatterySoH { module, soh } => {
                     let count = self.state.batteries.len().max(1);
@@ -1452,6 +1478,8 @@ impl DeviceModel for BatteryEngine {
             // Aging model: track throughput and degrade capacity
             let energy_this_tick = power_kw.abs() * ctx.dt_hours; // kWh throughput
             b.throughput_kwh += energy_this_tick;
+            b.lifetime.accumulate(power_kw, b.voltage_v, ctx.dt_hours);
+            b.session.accumulate(power_kw, b.voltage_v, ctx.dt_hours);
 
             // Update cycle count
             let nominal = b.nominal_capacity_kwh.max(0.1);
@@ -4552,6 +4580,83 @@ mod tests {
             (state.batteries[0].throughput_kwh - baseline - 3.0).abs() < 0.01,
             "expected throughput to climb by ~3 kWh, got delta {}",
             state.batteries[0].throughput_kwh - baseline,
+        );
+    }
+
+    #[test]
+    fn bms_counters_split_charge_and_discharge_per_tick() {
+        let mut state = PlantState::new(ts(12));
+        state.batteries[0].power_kw = 3.0;
+        state.batteries[0].voltage_v = 300.0;
+        state.sync_battery_from_vec();
+        let mut bat = BatteryEngine::new();
+        let ctx = TickContext {
+            now: ts(12),
+            dt_hours: 1.0,
+        };
+        bat.update(&ctx, &mut state);
+        let b = &state.batteries[0];
+        assert!(
+            (b.lifetime.charge_kwh - 3.0).abs() < 0.01,
+            "{:?}",
+            b.lifetime
+        );
+        assert!((b.lifetime.charge_ah - 10.0).abs() < 0.01, "3 kWh at 300 V");
+        assert_eq!(b.lifetime.discharge_kwh, 0.0);
+        assert_eq!(b.session, b.lifetime, "session counts alongside lifetime");
+
+        state.batteries[0].power_kw = -2.0;
+        state.sync_battery_from_vec();
+        bat.update(&ctx, &mut state);
+        let b = &state.batteries[0];
+        assert!(
+            (b.lifetime.discharge_kwh - 2.0).abs() < 0.01,
+            "{:?}",
+            b.lifetime
+        );
+        assert!(
+            (b.lifetime.charge_kwh - 3.0).abs() < 0.01,
+            "charge unchanged"
+        );
+        assert_eq!(state.battery.lifetime, b.lifetime, "battery mirror synced");
+    }
+
+    #[test]
+    fn set_hv_fault_words_sets_only_the_given_words() {
+        let devices: Vec<Box<dyn DeviceModel>> = vec![];
+        let state = PlantState::with_battery_count(ts(10), 2);
+        let mut engine = SimulationEngine::new(state, devices, 30);
+        engine.enqueue(Command::SetHvFaultWords {
+            module: 1,
+            bcu_warning: Some(0x10),
+            bcu_protection: None,
+            bcu_fault: Some(0x20),
+            bmu_fault: Some(0x8000_0000),
+        });
+        engine.enqueue(Command::SetHvFaultWords {
+            module: 1,
+            bcu_warning: None,
+            bcu_protection: Some(0x30),
+            bcu_fault: None,
+            bmu_fault: None,
+        });
+        engine.enqueue(Command::SetHvFaultWords {
+            module: 9, // no such module: ignored
+            bcu_warning: Some(1),
+            bcu_protection: None,
+            bcu_fault: None,
+            bmu_fault: None,
+        });
+        engine.apply_commands();
+        assert_eq!(engine.state.batteries[0].hv_faults, Default::default());
+        assert_eq!(
+            engine.state.batteries[1].hv_faults,
+            sim_models::HvFaultWords {
+                bcu_warning: 0x10,
+                bcu_protection: 0x30,
+                bcu_fault: 0x20,
+                bmu_fault: 0x8000_0000,
+            }
         );
     }
 

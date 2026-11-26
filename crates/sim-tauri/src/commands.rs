@@ -1859,6 +1859,60 @@ pub async fn clear_cell_overrides(
     Ok(dto)
 }
 
+#[derive(serde::Deserialize)]
+pub struct SetHvFaultWordsParams {
+    /// 0-based module index; the stack's BCU words are read from module 0.
+    pub module: usize,
+    /// BCU warning word (IR 114-115); `None` keeps it.
+    #[serde(default)]
+    pub bcu_warning: Option<u32>,
+    /// BCU protection word (IR 116-117); `None` keeps it.
+    #[serde(default)]
+    pub bcu_protection: Option<u32>,
+    /// BCU fault word (IR 118-119); `None` keeps it.
+    #[serde(default)]
+    pub bcu_fault: Option<u32>,
+    /// The module's BMU fault word (IR 122-123); `None` keeps it.
+    #[serde(default)]
+    pub bmu_fault: Option<u32>,
+}
+
+/// Set HV BMS alarm words on one module (`None` keeps a word).
+pub fn apply_hv_fault_words(
+    state: &mut sim_models::PlantState,
+    params: &SetHvFaultWordsParams,
+) -> Result<(), String> {
+    let b = state
+        .batteries
+        .get_mut(params.module)
+        .ok_or_else(|| format!("Battery module {} does not exist", params.module + 1))?;
+    let f = &mut b.hv_faults;
+    f.bcu_warning = params.bcu_warning.unwrap_or(f.bcu_warning);
+    f.bcu_protection = params.bcu_protection.unwrap_or(f.bcu_protection);
+    f.bcu_fault = params.bcu_fault.unwrap_or(f.bcu_fault);
+    f.bmu_fault = params.bmu_fault.unwrap_or(f.bmu_fault);
+    state.sync_battery_from_vec();
+    Ok(())
+}
+
+/// Inject HV BMS alarms: the BCU warning/protection/fault words and a BMU
+/// fault word, so a client's alert states can be exercised.
+#[tauri::command]
+pub async fn set_hv_fault_words(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    params: SetHvFaultWordsParams,
+) -> Result<PlantStateDto, String> {
+    let mut eng = state.engine.lock().await;
+    let e = eng
+        .as_mut()
+        .ok_or_else(|| "No plant exists — create or load a plant first".to_string())?;
+    apply_hv_fault_words(&mut e.state, &params)?;
+    let dto = PlantStateDto::from(&e.state);
+    let _ = app.emit("state_changed", &dto);
+    Ok(dto)
+}
+
 // ---------------------------------------------------------------------------
 // Grid port max power output
 // ---------------------------------------------------------------------------
@@ -2176,6 +2230,28 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("cell"), "{err}");
         assert!(state.batteries[0].cell_overrides.is_empty());
+    }
+
+    #[test]
+    fn apply_hv_fault_words_sets_given_words_and_rejects_bad_module() {
+        let mut state = sim_models::PlantState::with_battery_count(ts(), 2);
+        let params = |module, bmu_fault| SetHvFaultWordsParams {
+            module,
+            bcu_warning: Some(0x0001_0000),
+            bcu_protection: None,
+            bcu_fault: None,
+            bmu_fault,
+        };
+        apply_hv_fault_words(&mut state, &params(0, Some(7))).unwrap();
+        apply_hv_fault_words(&mut state, &params(0, None)).unwrap();
+        assert_eq!(state.batteries[0].hv_faults.bcu_warning, 0x0001_0000);
+        assert_eq!(
+            state.batteries[0].hv_faults.bmu_fault, 7,
+            "None keeps the word"
+        );
+        assert_eq!(state.battery.hv_faults, state.batteries[0].hv_faults);
+        let err = apply_hv_fault_words(&mut state, &params(2, Some(1))).unwrap_err();
+        assert!(err.contains("module 3"), "{err}");
     }
 
     #[test]

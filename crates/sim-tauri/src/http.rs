@@ -430,6 +430,10 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, (u16
             let params = param!(args);
             ok(c::clear_cell_overrides(app.clone(), state, params).await)
         }
+        "set_hv_fault_words" => {
+            let params = param!(args);
+            ok(c::set_hv_fault_words(app.clone(), state, params).await)
+        }
 
         other => Err((404, format!("unknown command: {other}"))),
     }

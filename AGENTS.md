@@ -60,8 +60,8 @@ ui/              — Web frontend (Vite + vanilla JS, served by Tauri on port 14
 
 ## Version
 
-**0.18.11** — The Gateway bank matches a live Gateway (home-energy-manager
-#456): one layout, version `GAAA0014` (IR(1603) = `0x0104`, digits as bytes,
+**0.18.11** — The Gateway bank matches a live Gateway
+(home-energy-manager #456): one layout, version `GAAA0014` (IR(1603) = `0x0104`, digits as bytes,
 never a layout selector), `uint32` totals high register first, AIO serials in
 a five-register stride from IR 1841. `gateway_fw_version` and the V2 paths are
 gone. 629 Rust + 5/5 scenarios green.
@@ -360,29 +360,34 @@ matches the inverter's DTC.
 - Slave `0x32`–`0x37`: one slave per battery module, IR 60–119 each.
 - `project_battery_bms(battery, idx)` — 16 cells, validity via SOC.
 
-**HV cluster protocol** (GIV-BAT-HV modular stacks, ThreePhase/AllInOne):
-Discovered via a 3-step chain (matches `givenergy-modbus` client.py and giv_tcp
-commands.refresh_plant_data):
+**HV protocol** (GIV-BAT-HV stacks; GivEnergy Hybrid Modbus RTU v4.4.1
+§4.4.2, decoded by GivEnergy's backend `HV_BCU_INPUT_REGISTER` /
+`HV_BMU_INPUT_REGISTER` / `HV_BMS_CONFIG_REGISTER`). All reads are FC 0x04,
+60 registers each. One stack, no BAMS, so the per-BAMS/per-BCU register
+offsets are 0:
 
-1. Slave `0xA0` (BMS), IR(60,5) → IR(61) = number of BCUs.
-2. Slave `0x70+i` (BCU), IR(60,60) → cluster data; IR(64) = modules; validity via
-   `pack_software_version` (IR 60–63) decoding to a non-blank string (gateway_version
-   converter).
-3. Slave `0x50+m` (BMU), IR(60,60) → per-module 24 cells + serial; validity via
-   `serial_number` (IR 114–118) decoding to a non-blank string.
+1. Slave `0xA0` config, IR 60-64: BAMS count (0), BCU count (1), BMUs per
+   stack, cells per module (24), temperature sensors per module (12).
+2. Slave `0x70` BCU, IR 60-179 (`project_battery_bcu`). 60-63 version
+   `BAAA` + raw digit bytes (`0x0000, 0x0103` = "BAAA.0013"), 79 power in
+   signed 0.1 kW, 80 SOC in the high byte, 82-97 lifetime/session counters
+   (`BatteryState.lifetime` / `.session`, energy summed, Ah the stack's),
+   114-119 alarm words from module 0's `hv_faults`. 120-137 are the stack's
+   cell extremes/averages, computed from exactly the cells the BMUs serve
+   (`hv_module_cells`), 138-142 the stack serial (`BCU` + module 0's
+   serial after `BAT`). 90-93 are 0.1 kWh, not the Wh the protocol says
+   (a real stack read 130 for a 40.2 Ah session).
+3. Slave `0x50+m` BMU, IR 60-179 (`project_battery_bmu`): 24 cell mV at
+   60-83, 24 signed 0.1 °C temps at 90-113, serial at 114-118 (must be
+   non-blank for `Bmu.is_valid()`); 120 module SOC, 121 balancer status,
+   122-123 the module's `hv_faults.bmu_fault`, 124-156 voltages, balancer
+   bits/current, version, serial and cell max/min/spread. A BMU balances
+   only when its cell spread exceeds 100 mV, i.e. with an injected cell.
 
-**Per-module SoC is NOT exposed on the HV wire.** BMU data is cells
-(IR 60–83, milli V) + temperatures (IR 90–113, deci °C) + serial (IR 114–118) only —
-confirmed against both `givenergy-modbus` (model/hv_bcu.py `Bmu`) and giv_tcp
-(model/hvbmu.py, read.py). SoC is **cluster-wide only**, packed at BCU IR(80) as
-`duint8`: high byte = `battery_soc_max`, low byte = `battery_soc_min` across the
-stack. `project_battery_bmu` correctly omits SoC; `project_battery_bcu` emits
-IR(80) as the sole SoC signal.
-
-Single-stack model: **1 BMS → 1 BCU → N BMUs** (N = `batteries.len()`), matching the
-GIV-BAT-HV datasheet systems (1–6 × GIV-BAT-3.4-HV). A 5-module stack (GIV-BAT-17.0-HV)
-needs 1 BCU + 5 BMU = **6 IR(60,60) reads per cycle**. Projectors:
-`project_battery_bms_discovery`, `project_battery_bcu`, `project_battery_bmu`.
+Any other FC 0x04 read on slaves 0x50-0xA0 (BCU 0x71+, BAMS 0x90+, IR 180+,
+a read running past IR 179/119) answers exception 0x02, never inverter
+data. Alarm words are set with `Command::SetHvFaultWords` / Tauri
+`set_hv_fault_words` (`POST /api/invoke/set_hv_fault_words`).
 
 If battery data comes back empty for an HV inverter, the cluster path (not the LV
 `0x32` path) is what needs serving — this was the original gap.

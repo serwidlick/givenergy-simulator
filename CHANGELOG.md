@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- The HV battery matches GivEnergy's Hybrid Modbus RTU protocol v4.4.1
+  §4.4.2 and backend decoder. The BCU (0x70) and BMUs (0x50+m) serve
+  IR 120-179: stack cell max/min/average with module and cell numbers,
+  busbar temperatures and the stack serial; module SOC, balancer status,
+  fault word, voltages, balancing bits/current, version and serial, and
+  cell voltage/temperature/SOC extremes. Slave 0xA0 answers the config
+  block (BAMS, BCU, BMU, cell and sensor counts). Any other HV range
+  returns exception 0x02 instead of inverter registers.
+- HV alarm injection: `Command::SetHvFaultWords` and Tauri/REST
+  `set_hv_fault_words` set the BCU warning/protection/fault words
+  (IR 114-119) and a module's BMU fault word (IR 122-123).
+- `BatteryState.lifetime` (saved) and `.session` (since start) count
+  charge/discharge kWh and Ah separately.
 - Per-cell override ("weak cell" injection). `BatteryState` gains a
   persisted `cell_overrides` map (`#[serde(default)]`, 0-based cell →
   `CellOverride { voltage_v, temperature_celsius }`) that pins one cell's
@@ -32,6 +45,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- HV BCU IR 60-119 encodings: version digits as raw bytes ("BAAA.0013"),
+  IR 66 sensors per module, IR 67/68 stack cell and sensor counts (the
+  averages moved to IR 136/137), running-mode enum, power in 0.1 kW (no
+  i16 overflow above 32.7 kW), SOC in IR 80's high byte, separate
+  discharge counters, capacity from SOH, cycles as an integer, status,
+  voltage/current limits, fan, balance-allowed, self-check and alarm
+  words.
 - The browser GUI on :8001 now serves the on-disk `ui/index.html` in debug
   builds even when the server's working directory is `crates/sim-tauri`
   (as under `cargo tauri dev`), so live frontend edits no longer need a

@@ -216,9 +216,10 @@ pub fn build_error_response(
 /// Supports multi-slave addressing for battery BMS modules:
 /// - Slave 0x32: inverter registers + battery #1 BMS (IR 60-119)
 /// - Slave 0x33-0x37: battery modules 2-6 BMS (IR 60-119) — LV protocol
-/// - Slave 0xA0: HV BMS discovery (IR 60-64; IR 61 = number of BCUs)
-/// - Slave 0x70: HV BCU cluster (IR 60-119; aggregates all modules)
-/// - Slave 0x50-0x57: HV BMU per-module cells (IR 60-119; one per module)
+/// - Slave 0xA0: HV BMS config (IR 60-64: BAMS, BCU, BMU, cell, sensor counts)
+/// - Slave 0x70: HV BCU stack (IR 60-179; aggregates all modules)
+/// - Slave 0x50-0x6F: HV BMU per module (IR 60-179; one per module)
+/// - Any other HV slave/range: exception 0x02
 ///
 /// CT meter slave addresses are determined at runtime from the DTC in the
 /// register store (HR 0), so the server adapts to inverter type changes.
@@ -470,26 +471,28 @@ pub async fn run_modbus_server(
 
                             // Determine if this read targets a battery device.
                             // LV BMS protocol: slaves 0x32-0x37 (IR 60-119 per module).
-                            // HV cluster protocol: slave 0xA0 (discovery),
-                            //   0x70+i (BCU cluster), 0x50+m (BMU per-module cells).
+                            // HV protocol (v4.4.1 §4.4.2), one stack, no BAMS: 0xA0
+                            //   config (IR 60-119), 0x70 BCU and 0x50+m BMU (IR 60-179).
                             // HV inverters (DTC family 4/8) are discovered via the
                             // cluster path; LV inverters via 0x32-0x37. Both are
                             // served unconditionally — clients only probe the path
                             // matching the inverter's DTC.
                             enum BatteryRead {
                                 LvBms(usize),
-                                HvBmsDiscovery,
+                                HvBmsConfig,
                                 HvBcu,
                                 HvBmu(usize),
                             }
+                            let within = |end: u32| {
+                                start_addr >= 60 && start_addr as u32 + count as u32 <= end
+                            };
+                            let hv_slave = (0x50..=0xA0).contains(&slave); // BMU, BCU, BAMS, config
                             let battery_read = if inner_func == FC_READ_INPUT {
-                                if slave == 0xA0 && (60..65).contains(&start_addr) {
-                                    Some(BatteryRead::HvBmsDiscovery)
-                                } else if slave == 0x70 && (60..120).contains(&start_addr) {
+                                if slave == 0xA0 && within(120) {
+                                    Some(BatteryRead::HvBmsConfig)
+                                } else if slave == 0x70 && within(180) {
                                     Some(BatteryRead::HvBcu)
-                                } else if (0x50..=0x6F).contains(&slave)
-                                    && (60..120).contains(&start_addr)
-                                {
+                                } else if (0x50..=0x6F).contains(&slave) && within(180) {
                                     Some(BatteryRead::HvBmu((slave - 0x50) as usize))
                                 } else if slave == 0x32 && (60..120).contains(&start_addr) {
                                     Some(BatteryRead::LvBms(0usize))
@@ -503,6 +506,20 @@ pub async fn run_modbus_server(
                             } else {
                                 None
                             };
+
+                            // Any other HV read (a range or BCU/BAMS we don't model)
+                            // is refused rather than answered with inverter data.
+                            if inner_func == FC_READ_INPUT && hv_slave && battery_read.is_none() {
+                                let resp = build_error_response(
+                                    &serial,
+                                    slave,
+                                    inner_func,
+                                    EC_ILLEGAL_DATA_ADDRESS,
+                                );
+                                let _ = stream.write_all(&resp).await;
+                                pending.drain(..frame_len);
+                                continue;
+                            }
 
                             // For Input-register reads into the gateway aggregation bank
                             // (IR 1600-1859), reject entirely unmapped sub-ranges with an
@@ -565,15 +582,15 @@ pub async fn run_modbus_server(
                                         Some(b) => store_guard.project_battery_bms(b, idx).to_vec(),
                                         None => vec![0u16; 60],
                                     },
-                                    BatteryRead::HvBmsDiscovery => {
-                                        store_guard.project_battery_bms_discovery(1).to_vec()
+                                    BatteryRead::HvBmsConfig => {
+                                        store_guard.project_battery_bms_config(&batts).to_vec()
                                     }
                                     BatteryRead::HvBcu => {
                                         store_guard.project_battery_bcu(&batts).to_vec()
                                     }
                                     BatteryRead::HvBmu(idx) => match batts.get(idx) {
                                         Some(b) => store_guard.project_battery_bmu(b, idx).to_vec(),
-                                        None => vec![0u16; 60],
+                                        None => vec![0u16; 120],
                                     },
                                 };
                                 drop(store_guard);

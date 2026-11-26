@@ -83,6 +83,7 @@ pub fn run() {
             commands::set_inverter_temperature,
             commands::set_cell_override,
             commands::clear_cell_overrides,
+            commands::set_hv_fault_words,
             commands::set_ct_meter,
             commands::get_grid_port_max_power,
             commands::set_grid_port_max_power,

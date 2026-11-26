@@ -1654,7 +1654,7 @@ async fn hv_bcu_reports_module_count() {
     assert_eq!(data[4], 5, "BCU IR(64) should report 5 modules");
     assert_eq!(data[5], 24, "BCU IR(65) cells_per_module should be 24");
     // Version prefix should be 'HV' → 0x4856
-    assert_eq!(data[0], 0x4856, "BCU version prefix should be 'HV'");
+    assert_eq!(data[0], 0x4241, "BCU version prefix should be 'BA'");
 }
 
 #[tokio::test]

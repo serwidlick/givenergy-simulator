@@ -807,6 +807,61 @@ pub struct BatteryState {
     /// `Command::SetCellOverride`, the GUI or `--cell-override`.
     #[serde(default)]
     pub cell_overrides: std::collections::BTreeMap<usize, CellOverride>,
+    /// Lifetime charge/discharge counters as the HV BCU reports them
+    /// (IR 82-89). Accumulated by `BatteryEngine` from plant creation.
+    #[serde(default)]
+    pub lifetime: BmsCounters,
+    /// The same counters for the current BMS session (IR 90-97): since the
+    /// simulator started, as a real BMS counts from power-up, so not saved.
+    #[serde(skip)]
+    pub session: BmsCounters,
+    /// Injected HV alarm words (BCU IR 114-119, BMU IR 122-123).
+    #[serde(default)]
+    pub hv_faults: HvFaultWords,
+}
+
+/// Charge/discharge energy and charge counters for one module.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct BmsCounters {
+    pub charge_kwh: f64,
+    pub discharge_kwh: f64,
+    pub charge_ah: f64,
+    pub discharge_ah: f64,
+}
+
+impl BmsCounters {
+    /// Add one tick of battery power (`power_kw` positive = charging) at
+    /// `voltage_v` over `dt_hours`.
+    pub fn accumulate(&mut self, power_kw: f64, voltage_v: f64, dt_hours: f64) {
+        let kwh = power_kw.abs() * dt_hours;
+        let ah = if voltage_v > 0.0 {
+            kwh * 1000.0 / voltage_v
+        } else {
+            0.0
+        };
+        if power_kw > 0.0 {
+            self.charge_kwh += kwh;
+            self.charge_ah += ah;
+        } else {
+            self.discharge_kwh += kwh;
+            self.discharge_ah += ah;
+        }
+    }
+}
+
+/// HV BMS alarm words a client can see, set to exercise the app's alert
+/// states. The stack's words (`bcu_*`) are read from the first module of the
+/// stack; `bmu_fault` is this module's own BMU fault word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct HvFaultWords {
+    #[serde(default)]
+    pub bcu_warning: u32,
+    #[serde(default)]
+    pub bcu_protection: u32,
+    #[serde(default)]
+    pub bcu_fault: u32,
+    #[serde(default)]
+    pub bmu_fault: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,6 +1074,9 @@ impl Default for BatteryState {
             current_a: 0.0,
             serial: String::new(),
             cell_overrides: std::collections::BTreeMap::new(),
+            lifetime: BmsCounters::default(),
+            session: BmsCounters::default(),
+            hv_faults: HvFaultWords::default(),
         }
     }
 }
@@ -3102,6 +3160,31 @@ mod tests {
                 max_ac_watts_for(inv),
             );
         }
+    }
+
+    #[test]
+    fn bms_counters_split_charge_and_discharge() {
+        let mut c = BmsCounters::default();
+        c.accumulate(2.0, 400.0, 0.5); // charging 1 kWh at 400 V = 2.5 Ah
+        c.accumulate(-1.0, 250.0, 1.0); // discharging 1 kWh at 250 V = 4 Ah
+        c.accumulate(0.0, 300.0, 1.0); // idle adds nothing
+        c.accumulate(-1.0, 0.0, 1.0); // no voltage: energy only
+        assert_eq!(c.charge_kwh, 1.0);
+        assert_eq!(c.charge_ah, 2.5);
+        assert_eq!(c.discharge_kwh, 2.0);
+        assert_eq!(c.discharge_ah, 4.0);
+    }
+
+    #[test]
+    fn hv_counters_and_faults_load_from_old_saves_and_session_is_not_saved() {
+        let mut b = BatteryState::default();
+        b.lifetime.charge_kwh = 29.1;
+        b.session.charge_kwh = 13.0;
+        b.hv_faults.bmu_fault = 0x8000_0001;
+        let back: BatteryState = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
+        assert_eq!(back.lifetime.charge_kwh, 29.1);
+        assert_eq!(back.session, BmsCounters::default());
+        assert_eq!(back.hv_faults.bmu_fault, 0x8000_0001);
     }
 
     // --- Per-cell overrides (weak cell injection) ---
