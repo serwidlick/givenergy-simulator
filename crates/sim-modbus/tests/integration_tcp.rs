@@ -411,7 +411,7 @@ async fn hv_battery_cluster_discovery_serves_bms_bcu_and_bmus() {
     let (_, _, data) = parse_read_payload(&payload);
     assert_eq!(data.len(), 60);
     // IR 60-63 version prefix non-blank ('H','V')
-    assert_eq!(data[0], 0x4856, "BCU version prefix must be 'HV'");
+    assert_eq!(data[0], 0x4241, "BCU version prefix must be 'BA'");
     assert_eq!(data[4], 5, "BCU IR(64) must report 5 modules");
     assert_eq!(data[5], 24, "BCU IR(65) cells_per_module = 24");
 
@@ -431,6 +431,73 @@ async fn hv_battery_cluster_discovery_serves_bms_bcu_and_bmus() {
             b' ',
             "slave {slave:#04x} serial must be non-blank"
         );
+    }
+}
+
+#[tokio::test]
+async fn hv_second_blocks_config_block_and_unmodelled_ranges() {
+    let mut state = PlantState::with_battery_count(
+        chrono::NaiveDate::from_ymd_opt(2025, 6, 1)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap(),
+        4,
+    );
+    for b in &mut state.batteries {
+        b.soc_percent = 81.0;
+    }
+    state.batteries[0].serial = "BATK3F9Q01".into();
+    state.sync_battery_from_vec();
+    let (addr, _store, _rx) = start_server(&state).await;
+    let serial = serial_arr();
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let read = |slave: u8, start: u16, count: u16| {
+        build_read_request(&serial, slave, FC_READ_INPUT, start, count)
+    };
+
+    // Config block: 0xA0, IR(60,60).
+    let req = read(0xA0, 60, 60);
+    let (_, func, payload) = decode_response(&send_recv(&mut stream, &req).await);
+    assert_eq!(func, FC_READ_INPUT);
+    let (_, _, data) = parse_read_payload(&payload);
+    assert_eq!(data.len(), 60);
+    assert_eq!(&data[..5], &[0, 1, 4, 24, 12]);
+
+    // BCU second block: 0x70, IR(120,60) -> stack serial at 138-142.
+    let req = read(0x70, 120, 60);
+    let (_, func, payload) = decode_response(&send_recv(&mut stream, &req).await);
+    assert_eq!(func, FC_READ_INPUT);
+    let (start, _, data) = parse_read_payload(&payload);
+    assert_eq!(start, 120);
+    let sn: String = data[18..23]
+        .iter()
+        .flat_map(|v| v.to_be_bytes())
+        .map(char::from)
+        .collect();
+    assert_eq!(sn, "BCUK3F9Q01");
+    assert_eq!(data[0], data[3] + data[14], "max cell = min cell + spread");
+
+    // BMU second block: 0x51, IR(120,60) -> module SOC and balancer status.
+    let req = read(0x51, 120, 60);
+    let (_, func, payload) = decode_response(&send_recv(&mut stream, &req).await);
+    assert_eq!(func, FC_READ_INPUT);
+    let (_, _, data) = parse_read_payload(&payload);
+    assert_eq!(data[0], 81, "IR 120 module SOC");
+    assert_eq!(data[1], 2, "IR 121 balancer standby");
+
+    // Unmodelled HV ranges answer exception 0x02, never inverter data.
+    for (slave, start, count) in [
+        (0x70, 180, 60),
+        (0x70, 150, 60), // runs past IR 179
+        (0x50, 180, 60),
+        (0x71, 60, 60), // no second stack
+        (0xA0, 120, 60),
+        (0x90, 60, 60), // no BAMS
+    ] {
+        let req = read(slave, start, count);
+        let (_, func, payload) = decode_response(&send_recv(&mut stream, &req).await);
+        assert_eq!(func, FC_READ_INPUT | 0x80, "slave {slave:#04x} IR {start}");
+        assert_eq!(payload[10], EC_ILLEGAL_DATA_ADDRESS);
     }
 }
 

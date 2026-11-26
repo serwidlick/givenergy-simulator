@@ -66,7 +66,21 @@ fn index_html() -> String {
     if let Ok(s) = std::fs::read_to_string("ui/index.html") {
         return s;
     }
+    // Debug builds (`cargo tauri dev` runs with cwd = crates/sim-tauri, so
+    // the relative lookup above misses): read the workspace copy by its
+    // compile-time path, so live edits reach the browser GUI on :8001
+    // without a rebuild. Production builds keep the embedded copy.
+    if cfg!(debug_assertions) {
+        if let Ok(s) = std::fs::read_to_string(dev_index_html_path()) {
+            return s;
+        }
+    }
     INDEX_HTML.to_string()
+}
+
+/// The workspace `ui/index.html` as known at compile time (debug fallback).
+fn dev_index_html_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui/index.html")
 }
 
 /// Run the HTTP server. Blocks forever; spawn on the Tauri async runtime.
@@ -408,6 +422,18 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, (u16
             let celsius = flat!(args, "celsius");
             ok(c::set_inverter_temperature(app.clone(), state, celsius).await)
         }
+        "set_cell_override" => {
+            let params = param!(args);
+            ok(c::set_cell_override(app.clone(), state, params).await)
+        }
+        "clear_cell_overrides" => {
+            let params = param!(args);
+            ok(c::clear_cell_overrides(app.clone(), state, params).await)
+        }
+        "set_hv_fault_words" => {
+            let params = param!(args);
+            ok(c::set_hv_fault_words(app.clone(), state, params).await)
+        }
 
         other => Err((404, format!("unknown command: {other}"))),
     }
@@ -707,6 +733,17 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_index_html_serves_the_workspace_file_whatever_the_cwd() {
+        // The dev server runs with cwd = crates/sim-tauri; the served page
+        // must still be the on-disk ui/index.html, not the embedded copy.
+        let on_disk = std::fs::read_to_string(dev_index_html_path()).unwrap();
+        if cfg!(debug_assertions) {
+            assert_eq!(index_html(), on_disk);
+        }
+        assert!(dev_index_html_path().ends_with("ui/index.html"));
+    }
 
     #[test]
     fn finds_header_terminator() {

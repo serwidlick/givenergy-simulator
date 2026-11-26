@@ -265,6 +265,44 @@ fn hv_bmu_serial(battery: &sim_models::BatteryState, module_index: usize, cells:
     }
 }
 
+/// HV module layout (protocol v4.4.1 defaults) and limits.
+const HV_CELLS_PER_MODULE: usize = 24;
+const HV_TEMP_SENSORS_PER_MODULE: u16 = 12;
+/// Module nominal voltage, 24 LFP cells x 3.2 V, for Ah from kWh.
+const HV_MODULE_NOMINAL_V: f64 = 76.8;
+/// Per-cell discharge floor and charge ceiling (254.4 V / 348.5 V for the
+/// reference 96-cell stack).
+const HV_CELL_MIN_V: f64 = 2.65;
+const HV_CELL_MAX_V: f64 = 3.63;
+/// Cell spread above which a BMU balances. Above the ±1 % per-cell noise
+/// (about 70 mV at most) so only an injected weak/strong cell triggers it.
+const HV_BALANCE_START_MV: u16 = 100;
+
+/// One HV module's 24 cell voltages (mV) and temperatures (signed 0.1 °C),
+/// as the BMU serves them: SOC-driven LFP voltage with ≤1 % deterministic
+/// per-cell noise, the module temperature, and any pinned cell overrides.
+fn hv_module_cells(
+    battery: &sim_models::BatteryState,
+    module_index: usize,
+) -> ([u16; HV_CELLS_PER_MODULE], [i16; HV_CELLS_PER_MODULE]) {
+    let base_mv = (3.3 + (battery.soc_percent - 50.0) * 0.003) * 1000.0;
+    let module_t = battery.temperature_celsius;
+    let mv = std::array::from_fn(
+        |c| match battery.cell_override(c).and_then(|o| o.voltage_v) {
+            Some(v) => (v * 1000.0).round() as u16,
+            None => (base_mv * cell_voltage_factor(module_index, c)).round() as u16,
+        },
+    );
+    let temps = std::array::from_fn(|c| {
+        let t = battery
+            .cell_override(c)
+            .and_then(|o| o.temperature_celsius)
+            .unwrap_or(module_t);
+        (t * 10.0).round() as i16
+    });
+    (mv, temps)
+}
+
 impl RegisterStore {
     /// Create a store pre-populated from the given register definitions.
     pub fn new(defs: Vec<RegisterDef>) -> Self {
@@ -2778,14 +2816,39 @@ impl RegisterStore {
         let cell_count = 16usize;
         let base_mv = battery.voltage_v * 1000.0 / cell_count as f64;
         for (i, reg) in regs.iter_mut().take(cell_count).enumerate() {
-            *reg = (base_mv * cell_voltage_factor(module_index, i)).round() as u16; // IR 60+i
+            // IR 60+i; a pinned cell (`BatteryState::cell_overrides`) wins.
+            *reg = match battery.cell_override(i).and_then(|o| o.voltage_v) {
+                Some(v) => (v * 1000.0).round() as u16,
+                None => (base_mv * cell_voltage_factor(module_index, i)).round() as u16,
+            };
         }
 
-        // Cell group temperatures: IR 76-79 (0.1 °C)
+        // Cell group temperatures: IR 76-79 (0.1 °C). Each sensor covers
+        // four cells; a pinned cell temperature shows on its group's sensor
+        // (the hottest/coldest pinned cell of the group, whichever moves
+        // furthest from the module temperature).
         let temp_deci = (battery.temperature_celsius * 10.0).round() as u16;
-        for i in 0..4 {
-            regs[16 + i] = temp_deci; // IR 76+i
+        let cell_temp_deci = |cell: usize| -> Option<u16> {
+            battery
+                .cell_override(cell)
+                .and_then(|o| o.temperature_celsius)
+                .map(|t| (t * 10.0).round().max(0.0) as u16)
+        };
+        for g in 0..4 {
+            let pinned = (g * 4..g * 4 + 4)
+                .filter_map(cell_temp_deci)
+                .max_by_key(|&t| (t as i32 - temp_deci as i32).unsigned_abs());
+            regs[16 + g] = pinned.unwrap_or(temp_deci); // IR 76+g
         }
+        let (cells_t_max, cells_t_min) = (0..cell_count).filter_map(cell_temp_deci).fold(
+            (None::<u16>, None::<u16>),
+            |(mx, mn), t| {
+                (
+                    Some(mx.map_or(t, |m| m.max(t))),
+                    Some(mn.map_or(t, |m| m.min(t))),
+                )
+            },
+        );
 
         // v_cells_sum: IR 80 (mV)
         regs[20] = (battery.voltage_v * 1000.0).round() as u16;
@@ -2843,10 +2906,11 @@ impl RegisterStore {
         regs[41] = (cap_design_ah >> 16) as u16;
         regs[42] = (cap_design_ah & 0xFFFF) as u16;
 
-        // t_max: IR 103 (0.1 °C)
-        regs[43] = temp_deci;
-        // t_min: IR 104 (0.1 °C)
-        regs[44] = (temp_deci as f64 * 0.98).round() as u16;
+        // t_max: IR 103 (0.1 °C) — a pinned hot cell raises it.
+        regs[43] = cells_t_max.map_or(temp_deci, |t| t.max(temp_deci));
+        // t_min: IR 104 (0.1 °C) — a pinned cold cell lowers it.
+        let base_t_min = (temp_deci as f64 * 0.98).round() as u16;
+        regs[44] = cells_t_min.map_or(base_t_min, |t| t.min(base_t_min));
 
         // IR 105: e_battery_discharge_total (uint16, ×0.1 kWh)
         // IR 106: e_battery_charge_total (uint16, ×0.1 kWh)
@@ -2867,160 +2931,276 @@ impl RegisterStore {
         regs
     }
 
-    /// HV BMS discovery data (slave 0xA0), IR 60-64.
-    ///
-    /// A real client (givenergy-modbus / giv_tcp) reads IR(60,5) at slave 0xA0
-    /// during cold HV discovery; IR(61) holds the number of BCUs present. We
-    /// model single-stack GIV-BAT-HV systems as one BCU, so IR(61) = 1.
-    pub fn project_battery_bms_discovery(&self, num_bcus: usize) -> [u16; 5] {
-        let mut regs = [0u16; 5];
-        // IR(60): BMS software version nibble (non-zero so the version is not blank).
-        regs[0] = 1;
-        // IR(61): number of BCUs present (the field the client decodes).
-        regs[1] = num_bcus as u16;
-        // IR(62-64): reserved / unused by either reference library.
+    /// HV BMS config block (slave 0xA0), IR 60-64 (protocol v4.4.1 §4.4.2):
+    /// BAMS count, BCU (stack) count, BMUs per stack, cells per module,
+    /// temperature sensors per module. One stack, no BAMS.
+    pub fn project_battery_bms_config(&self, batteries: &[sim_models::BatteryState]) -> [u16; 5] {
+        [
+            0,
+            1,
+            batteries.len() as u16,
+            HV_CELLS_PER_MODULE as u16,
+            HV_TEMP_SENSORS_PER_MODULE,
+        ]
+    }
+
+    /// HV BCU stack data (slave 0x70), IR 60-179, per the GivEnergy Hybrid
+    /// Modbus protocol v4.4.1 §4.4.2 and GivEnergy's backend decoder
+    /// (`HV_BCU_INPUT_REGISTER`). IR 120-142 are derived from exactly the
+    /// cells the BMUs serve. The stack's alarm words come from its first
+    /// module (`hv_faults.bcu_*`).
+    pub fn project_battery_bcu(&self, batteries: &[sim_models::BatteryState]) -> [u16; 120] {
+        let mut regs = [0u16; 120];
+        let mut set = |addr: usize, v: u16| regs[addr - 60] = v;
+        let n = batteries.len().max(1) as f64;
+        let cells_total = batteries.len() * HV_CELLS_PER_MODULE;
+        let mean =
+            |f: &dyn Fn(&sim_models::BatteryState) -> f64| batteries.iter().map(f).sum::<f64>() / n;
+        let sum =
+            |f: &dyn Fn(&sim_models::BatteryState) -> f64| batteries.iter().map(f).sum::<f64>();
+        let faults = batteries.first().map(|b| b.hv_faults).unwrap_or_default();
+
+        // 60-63: "BAAA" then the version digits as raw bytes: "BAAA.0013".
+        set(60, u16::from_be_bytes(*b"BA"));
+        set(61, u16::from_be_bytes(*b"AA"));
+        set(62, 0x0000);
+        set(63, 0x0103);
+        set(64, batteries.len() as u16);
+        set(65, HV_CELLS_PER_MODULE as u16);
+        set(66, HV_TEMP_SENSORS_PER_MODULE);
+        set(67, cells_total as u16);
+        set(68, batteries.len() as u16 * HV_TEMP_SENSORS_PER_MODULE);
+
+        // Modules are in series: voltage and energy sum; current, Ah and
+        // capacity are the stack's (the mean of its modules).
+        let voltage = sum(&|b| b.voltage_v);
+        let power_kw = sum(&|b| b.power_kw);
+        let soc = mean(&|b| b.soc_percent);
+        // 70 running mode: 2 standby, 3 charge, 4 discharge, 5 fault.
+        set(
+            70,
+            if faults.bcu_fault != 0 {
+                5
+            } else if power_kw > 0.01 {
+                3
+            } else if power_kw < -0.01 {
+                4
+            } else {
+                2
+            },
+        );
+        set(73, (voltage * 10.0).round() as u16); // bus voltage
+        set(74, (voltage * 10.0).round() as u16); // battery voltage
+        let current = batteries.first().map_or(0.0, |b| b.current_a);
+        set(76, (current * 10.0).round() as i16 as u16); // + = charging
+        set(79, (power_kw * 10.0).round() as i16 as u16); // 0.1 kW, + = charging
+        set(80, (soc.round().clamp(0.0, 100.0) as u16) << 8); // low byte: debug
+        set(
+            81,
+            (mean(&|b| b.soh) * 100.0).round().clamp(0.0, 100.0) as u16,
+        );
+
+        let mut set_u32 = |addr: usize, v: f64| {
+            let raw = (v * 10.0).round().max(0.0) as u32;
+            regs[addr - 60] = (raw >> 16) as u16;
+            regs[addr - 59] = raw as u16;
+        };
+        set_u32(82, sum(&|b| b.lifetime.charge_kwh));
+        set_u32(84, sum(&|b| b.lifetime.discharge_kwh));
+        set_u32(86, mean(&|b| b.lifetime.charge_ah));
+        set_u32(88, mean(&|b| b.lifetime.discharge_ah));
+        // The protocol says Wh for 90-93, but a real stack read 130 for a
+        // 40.2 Ah session at ~315 V, which only fits 0.1 kWh.
+        set_u32(90, sum(&|b| b.session.charge_kwh));
+        set_u32(92, sum(&|b| b.session.discharge_kwh));
+        set_u32(94, mean(&|b| b.session.charge_ah));
+        set_u32(96, mean(&|b| b.session.discharge_ah));
+
+        let mut set = |addr: usize, v: u16| regs[addr - 60] = v;
+        let capacity_ah = mean(&|b| b.capacity_kwh) * 1000.0 / HV_MODULE_NOMINAL_V;
+        set(98, (capacity_ah * 10.0).round() as u16);
+        set(99, (capacity_ah * soc / 100.0 * 10.0).round() as u16);
+        set(100, mean(&|b| b.cycle_count).floor() as u16);
+        // 101: b0 charge enabled, b1 discharge enabled (b2/b3 requests unused).
+        let healthy = faults.bcu_fault == 0 && faults.bcu_protection == 0;
+        set(
+            101,
+            u16::from(healthy && soc < 100.0) | (u16::from(healthy && soc > 0.0) << 1),
+        );
+        set(
+            102,
+            (cells_total as f64 * HV_CELL_MIN_V * 10.0).round() as u16,
+        );
+        set(
+            103,
+            (cells_total as f64 * HV_CELL_MAX_V * 10.0).round() as u16,
+        );
+        let nominal_v = (cells_total as f64 * 3.2).max(1.0);
+        set(
+            104,
+            (sum(&|b| b.max_discharge_kw) * 1000.0 / nominal_v * 10.0).round() as u16,
+        );
+        set(
+            105,
+            (sum(&|b| b.max_charge_kw) * 1000.0 / nominal_v * 10.0).round() as u16,
+        );
+        // 106: fan speed % (high byte) and status (low byte); on above 35 °C.
+        let hottest = batteries
+            .iter()
+            .map(|b| b.temperature_celsius)
+            .fold(f64::MIN, f64::max);
+        set(106, if hottest > 35.0 { (60 << 8) | 1 } else { 0 });
+        // 108-109: one bit per module allowed to balance (u32, high first).
+        let allowed = 1u32
+            .checked_shl(batteries.len() as u32)
+            .map_or(u32::MAX, |b| b - 1);
+        set(108, (allowed >> 16) as u16);
+        set(109, allowed as u16);
+        set(113, 0b1111); // self-check: voltage, temperature, total V, insulation OK
+        for (addr, word) in [
+            (114, faults.bcu_warning),
+            (116, faults.bcu_protection),
+            (118, faults.bcu_fault),
+        ] {
+            set(addr, (word >> 16) as u16);
+            set(addr + 1, word as u16);
+        }
+
+        // 120-137: stack cell extremes, from the cells the BMUs serve.
+        // (value, 1-based module, 1-based cell)
+        let mut mv = Vec::with_capacity(cells_total);
+        let mut temps = Vec::with_capacity(cells_total);
+        for (m, b) in batteries.iter().enumerate() {
+            let (v, t) = hv_module_cells(b, m);
+            for c in 0..HV_CELLS_PER_MODULE {
+                mv.push((v[c] as i32, m as u16 + 1, c as u16 + 1));
+                temps.push((t[c] as i32, m as u16 + 1, c as u16 + 1));
+            }
+        }
+        // Ties go to the first cell, as a BMS scanning in order would report.
+        let extremes = |xs: &[(i32, u16, u16)]| {
+            let max = xs
+                .iter()
+                .copied()
+                .reduce(|a, b| if b.0 > a.0 { b } else { a });
+            let min = xs
+                .iter()
+                .copied()
+                .reduce(|a, b| if b.0 < a.0 { b } else { a });
+            (max.unwrap_or_default(), min.unwrap_or_default())
+        };
+        let avg = |xs: &[(i32, u16, u16)]| {
+            (xs.iter().map(|x| x.0 as f64).sum::<f64>() / xs.len().max(1) as f64).round() as i32
+        };
+        let (vmax, vmin) = extremes(&mv);
+        let (tmax, tmin) = extremes(&temps);
+        for (addr, (v, m, c)) in [(120, vmax), (123, vmin), (126, tmax), (129, tmin)] {
+            set(addr, v as i16 as u16);
+            set(addr + 1, m);
+            set(addr + 2, c);
+        }
+        let deci = |t: f64| (t * 10.0).round() as i16 as u16;
+        set(132, deci(hottest.max(-40.0)));
+        let coldest = batteries
+            .iter()
+            .map(|b| b.temperature_celsius)
+            .fold(f64::MAX, f64::min);
+        set(133, deci(coldest.min(125.0)));
+        set(134, (vmax.0 - vmin.0) as u16);
+        set(135, (tmax.0 - tmin.0) as u16);
+        set(136, avg(&mv) as u16);
+        set(137, avg(&temps) as i16 as u16);
+        let serial = match batteries.first().map(|b| b.serial.as_str()) {
+            Some(s) if s.starts_with("BAT") => format!("BCU{}", &s[3..]),
+            _ => "BCU0000001".to_string(),
+        };
+        regs[78..83].copy_from_slice(&encode_serial_regs(&serial)); // 138-142
         regs
     }
 
-    /// HV BCU cluster data (slave 0x70+i), IR 60-119.
+    /// HV BMU per-module data (slave 0x50+m), IR 60-179.
     ///
-    /// Aggregates all modules in the stack into one cluster view, following the
-    /// BCU register LUT shared by givenergy-modbus (model/hv_bcu.py) and giv_tcp
-    /// (givenergy_modbus_async/model/hvbcu.py). Validity hinges on
-    /// `pack_software_version` (IR 60-63) decoding to a non-blank string via the
-    /// gateway_version converter, so the version encoding must round-trip.
-    pub fn project_battery_bcu(&self, batteries: &[sim_models::BatteryState]) -> [u16; 60] {
-        let mut regs = [0u16; 60];
-        let n = batteries.len().max(1);
-
-        // IR 60-63: pack_software_version. gateway_version(r60,r61,r62,r63) builds
-        // prefix = latin1(r60||r61) with nulls stripped, digits = decimal bytes of
-        // r62||r63. Encode "HV00000001" so is_valid() (not blank, not all '0') holds.
-        regs[0] = 0x4856; // 'H','V'
-        regs[1] = 0x3030; // '0','0'
-        regs[2] = 0x3030; // '0','0'
-        regs[3] = 0x3031; // '0','1'
-
-        // IR 64: number_of_modules
-        regs[4] = batteries.len() as u16;
-        // IR 65: cells_per_module (all known HV stacks use 24 cells/module)
-        regs[5] = 24;
-
-        // IR 67: cluster_cell_voltage (milli V), IR 68: cluster_cell_temperature (deci °C),
-        // IR 70: status. Set after aggregate values are computed below.
-
-        // Aggregate cluster values. Modules are in series: stack voltage sums,
-        // current is shared, power sums, SOC/SOH average.
-        let avg_soc = batteries.iter().map(|b| b.soc_percent).sum::<f64>() / n as f64;
-        let stack_voltage = batteries.iter().map(|b| b.voltage_v).sum::<f64>();
-        let stack_current = batteries.first().map(|b| b.current_a).unwrap_or(0.0);
-        let power_kw = batteries.iter().map(|b| b.power_kw).sum::<f64>();
-        let avg_soh = batteries.iter().map(|b| b.soh).sum::<f64>() / n as f64;
-        let avg_cycles = batteries.iter().map(|b| b.cycle_count).sum::<f64>() / n as f64;
-        let soc_max = batteries
-            .iter()
-            .map(|b| b.soc_percent)
-            .fold(0.0_f64, f64::max)
-            .round()
-            .clamp(0.0, 100.0) as u16;
-        let soc_min = batteries
-            .iter()
-            .map(|b| b.soc_percent)
-            .fold(300.0_f64, f64::min)
-            .round()
-            .clamp(0.0, 100.0) as u16;
-
-        // IR 67: cluster_cell_voltage (milli V) — average cell voltage across stack
-        let avg_cell_v = stack_voltage / (n as f64 * 24.0);
-        regs[7] = (avg_cell_v * 1000.0).round() as u16;
-        // IR 68: cluster_cell_temperature (deci °C) — average across all modules
-        let avg_temp = batteries.iter().map(|b| b.temperature_celsius).sum::<f64>() / n as f64;
-        regs[8] = (avg_temp * 10.0).round() as u16;
-        // IR 70: status — 0x01 = normal operation
-        regs[10] = 0x01;
-
-        // IR 73: battery_voltage (deci V)
-        regs[13] = (stack_voltage * 10.0).round() as u16;
-        // IR 74: load_voltage (deci V) — mirror stack voltage
-        regs[14] = regs[13];
-        // IR 76: battery_current (int16, deci A, signed: + = charging)
-        regs[16] = (stack_current * 10.0).round() as i16 as u16;
-        // IR 79: battery_power (milli: raw = kW * 1000, signed)
-        regs[19] = (power_kw * 1000.0).round() as i16 as u16;
-        // IR 80: SOC max/min (duint8: high byte = max, low byte = min)
-        regs[20] = (soc_max << 8) | soc_min;
-        // IR 81: battery_soh (uint16 %)
-        regs[21] = (avg_soh * 100.0).round().clamp(0.0, 100.0) as u16;
-
-        // IR 82-83: charge_energy_total (uint32, deci kWh)
-        let charge_total = batteries.iter().map(|b| b.throughput_kwh).sum::<f64>();
-        let ct_raw = (charge_total * 10.0).round() as u32;
-        regs[22] = (ct_raw >> 16) as u16;
-        regs[23] = (ct_raw & 0xFFFF) as u16;
-        // IR 84-85: discharge_energy_total — mirror (sim doesn't track separately)
-        regs[24] = regs[22];
-        regs[25] = regs[23];
-
-        // IR 90-91: charge_energy_today, IR 92-93: discharge_energy_today — left 0
-        // (cluster-level daily totals are not modelled per-module).
-
-        // IR 98: nominal_capacity (deci Ah). Calculated from the user-configured
-        // per-module capacity and the three-phase stack nominal voltage (76.8 V).
-        // Previously hardcoded to 510 (51.0 Ah × 76.8 V = 3.9 kWh per module)
-        // which didn't reflect user-chosen battery size.
-        let module_capacity_kwh = batteries
-            .first()
-            .map(|b| b.nominal_capacity_kwh)
-            .unwrap_or(3.4);
-        let module_nominal_ah = (module_capacity_kwh * 1000.0 / 76.8 * 10.0).round() as u16;
-        regs[38] = module_nominal_ah;
-        // IR 99: remaining_battery_capacity (deci Ah), scaled by SOC
-        let remaining_ah = module_nominal_ah as f64 * avg_soc / 100.0;
-        regs[39] = remaining_ah.round() as u16;
-        // IR 100: number_of_cycles (deci)
-        regs[40] = (avg_cycles * 10.0).round() as u16;
-
-        regs
-    }
-
-    /// HV BMU per-module data (slave 0x50+m), IR 60-119.
-    ///
-    /// Follows the BMU layout in givenergy-modbus (model/hv_bcu.py Bmu) and
-    /// giv_tcp (model/hvbmu.py): 24 cell voltages at IR 60-83 (milli V), 24 cell
-    /// temperatures at IR 90-113 (deci °C), and a 5-register serial at IR 114-118.
-    /// Validity hinges on the serial decoding to a non-blank string.
+    /// IR 60-119 follow GivEnergy's backend (`HV_BMU_INPUT_REGISTER`),
+    /// givenergy-modbus and giv_tcp: 24 cell voltages at IR 60-83 (mV), 24
+    /// cell temperatures at IR 90-113 (signed 0.1 °C) and the serial at IR
+    /// 114-118, which must decode non-blank for `Bmu.is_valid()`. IR 120-156
+    /// are the module/balancer block of protocol v4.4.1 §4.4.2.
     pub fn project_battery_bmu(
         &self,
         battery: &sim_models::BatteryState,
         module_index: usize,
-    ) -> [u16; 60] {
-        let mut regs = [0u16; 60];
-        let cells = 24usize;
-
-        // IR 60-83: 24 cell voltages (milli V). Nominal LFP ~3.2-3.4 V/cell,
-        // nudged by SOC so the cluster looks healthy and varying, plus ≤1%
-        // deterministic per-cell noise (see cell_voltage_factor).
-        let cell_v = 3.3 + (battery.soc_percent - 50.0) * 0.003;
-        let base_mv = cell_v * 1000.0;
-        for (i, reg) in regs.iter_mut().take(cells).enumerate() {
-            *reg = (base_mv * cell_voltage_factor(module_index, i)).round() as u16; // IR 60+i
+    ) -> [u16; 120] {
+        let mut regs = [0u16; 120];
+        let (mv, temps) = hv_module_cells(battery, module_index);
+        regs[..HV_CELLS_PER_MODULE].copy_from_slice(&mv); // IR 60-83
+        for (reg, t) in regs[30..54].iter_mut().zip(temps) {
+            *reg = t as u16; // IR 90-113
         }
+        let serial = hv_bmu_serial(battery, module_index, HV_CELLS_PER_MODULE);
+        regs[54..59].copy_from_slice(&encode_serial_regs(&serial)); // IR 114-118
 
-        // IR 90-113: 24 cell temperatures (deci °C)
-        let temp_deci = (battery.temperature_celsius * 10.0).round() as u16;
-        for i in 0..cells {
-            if 30 + i < 60 {
-                regs[30 + i] = temp_deci; // IR 90+i
-            }
+        let mut set = |addr: usize, v: u16| regs[addr - 60] = v;
+        let soc = battery.soc_percent.round().clamp(0.0, 100.0);
+        let (vmax, vmin) = (*mv.iter().max().unwrap(), *mv.iter().min().unwrap());
+        let (tmax, tmin) = (*temps.iter().max().unwrap(), *temps.iter().min().unwrap());
+        let avg_mv = mv.iter().map(|&v| v as f64).sum::<f64>() / HV_CELLS_PER_MODULE as f64;
+        // Cell SOC: the module SOC moved 0.1 % per mV off the average cell.
+        let cell_soc = |v: u16| (soc + (v as f64 - avg_mv) * 0.1).round().clamp(0.0, 100.0) as u16;
+        let fault = battery.hv_faults.bmu_fault;
+        let balancing = fault == 0 && vmax - vmin > HV_BALANCE_START_MV;
+
+        set(120, soc as u16);
+        // 121: 0 starting, 1 balancing, 2 standby, 3 updating, 4 fault.
+        set(
+            121,
+            if fault != 0 {
+                4
+            } else if balancing {
+                1
+            } else {
+                2
+            },
+        );
+        set(122, (fault >> 16) as u16);
+        set(123, fault as u16);
+        set(
+            124,
+            (mv.iter().map(|&v| v as f64).sum::<f64>() / 100.0).round() as u16,
+        );
+        set(125, (battery.voltage_v * 10.0).round() as u16);
+        set(
+            126,
+            (battery.temperature_celsius * 10.0).round() as i16 as u16,
+        );
+        if balancing {
+            // Passive balancing bleeds the cells well above the weakest one.
+            let bits = (0..HV_CELLS_PER_MODULE)
+                .filter(|&c| mv[c] - vmin > HV_BALANCE_START_MV)
+                .fold(0u32, |acc, c| acc | (1 << c));
+            set(127, (bits >> 16) as u16); // cells 17-24, low byte
+            set(128, bits as u16); // cells 1-16
+            set(129, 100); // 1.00 A
+            // shortcut: capacity still to balance = spread mV x 0.01 Ah, a
+            // plausible size only; balanced capacity is not tracked.
+            let to_balance = (vmax - vmin) as u32 * 100;
+            set(132, (to_balance >> 16) as u16);
+            set(133, to_balance as u16);
         }
-
-        // IR 114-118: serial number (5 regs = 10 Latin-1 chars).
-        regs[54..59].copy_from_slice(&encode_serial_regs(&hv_bmu_serial(
-            battery,
-            module_index,
-            cells,
-        )));
-
+        // 134-137: balancer software version, 8 ASCII characters.
+        for (i, pair) in b"BMUA0013".chunks(2).enumerate() {
+            set(134 + i, u16::from_be_bytes([pair[0], pair[1]]));
+        }
+        regs[78..83].copy_from_slice(&encode_serial_regs(&serial)); // 138-142
+        let mut set = |addr: usize, v: u16| regs[addr - 60] = v;
+        set(145, vmax);
+        set(146, vmin);
+        set(148, tmax as u16);
+        set(149, tmin as u16);
+        set(151, cell_soc(vmax));
+        set(152, cell_soc(vmin));
+        set(154, vmax - vmin);
+        set(155, (tmax - tmin) as u16);
+        set(156, cell_soc(vmax) - cell_soc(vmin));
         regs
     }
 
@@ -8170,7 +8350,7 @@ mod tests {
     }
 
     /// IR 114-118 of an HV BMU block.
-    fn bmu_serial(bmu: &[u16; 60]) -> String {
+    fn bmu_serial(bmu: &[u16]) -> String {
         decode_serial(&bmu[54..59])
     }
 
@@ -8291,63 +8471,290 @@ mod tests {
         assert_ne!(before, other);
     }
 
-    #[test]
-    fn hv_bms_discovery_reports_one_bcu() {
-        // Cold HV discovery reads IR(60,5) at slave 0xA0; IR(61) = number of BCUs.
-        // Our single-stack model always reports 1 BCU.
-        let store = RegisterStore::new(default_register_catalogue());
-        let bms = store.project_battery_bms_discovery(1);
-        assert_eq!(bms[0], 1, "IR(60) BMS version nibble must be non-zero");
-        assert_eq!(bms[1], 1, "IR(61) must report 1 BCU for a single stack");
+    /// The real 4-module stack GivEnergy's portal showed (see the HV tests).
+    fn reference_hv_stack() -> Vec<sim_models::BatteryState> {
+        (0..4)
+            .map(|_| sim_models::BatteryState {
+                soc_percent: 81.0,
+                voltage_v: 78.9, // 4 x 78.9 = 315.6 V
+                current_a: -3.1,
+                power_kw: -0.225, // 4 x = -0.9 kW
+                soh: 1.0,
+                nominal_capacity_kwh: 3.9936,
+                capacity_kwh: 3.9936, // 52.0 Ah at 76.8 V
+                cycle_count: 1.2,
+                max_discharge_kw: 3.84, // 4 x / 307.2 V nominal = 50 A
+                max_charge_kw: 1.92,    // 25 A
+                temperature_celsius: 25.0,
+                lifetime: sim_models::BmsCounters {
+                    charge_kwh: 29.1 / 4.0,
+                    discharge_kwh: 19.6 / 4.0,
+                    charge_ah: 87.3,
+                    discharge_ah: 60.2,
+                },
+                session: sim_models::BmsCounters {
+                    charge_kwh: 13.0 / 4.0,
+                    discharge_kwh: 3.3 / 4.0,
+                    charge_ah: 40.2,
+                    discharge_ah: 10.6,
+                },
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn u32_at(regs: &[u16], i: usize) -> u32 {
+        ((regs[i] as u32) << 16) | regs[i + 1] as u32
     }
 
     #[test]
-    fn hv_bcu_cluster_decodes_valid_and_aggregates_modules() {
-        // The user's GIV-BAT-17.0-HV case: 5 x GIV-BAT-3.4-HV modules behind a
-        // ThreePhase inverter. The BCU at slave 0x70 must (a) decode to a valid
-        // pack_software_version so Bcu.is_valid() holds, and (b) aggregate the
-        // 5 modules into one cluster view.
-        let mut state = PlantState::with_battery_count(test_ts(), 5);
-        for b in &mut state.batteries {
-            // Use GIV-BAT-3.4-HV sizing: 3.4 kWh nominal per module
-            b.soc_percent = 60.0;
-            b.voltage_v = 51.2;
-            b.soh = 0.95;
-            b.nominal_capacity_kwh = 3.4;
-            b.capacity_kwh = b.nominal_capacity_kwh * b.soh;
-        }
-        state.sync_battery_from_vec();
-
+    fn hv_bms_config_block_reports_the_stack_layout() {
+        // Slave 0xA0, IR 60-64: BAMS count, BCU count, BMUs per stack, cells
+        // per module, temperature sensors per module.
         let store = RegisterStore::new(default_register_catalogue());
-        let bcu = store.project_battery_bcu(&state.batteries);
+        let cfg = store.project_battery_bms_config(&reference_hv_stack());
+        assert_eq!(cfg, [0, 1, 4, 24, 12]);
+    }
 
-        // IR 60-63 pack_software_version decodes via gateway_version to
-        // "HV00000001" — not blank, not all '0', so Bcu.is_valid() is true.
-        let prefix = [bcu[0], bcu[1]]
+    #[test]
+    fn hv_bcu_first_block_matches_the_reference_stack() {
+        let store = RegisterStore::new(default_register_catalogue());
+        let bcu = store.project_battery_bcu(&reference_hv_stack());
+        let r = |a: usize| bcu[a - 60];
+
+        // 60-63 "BAAA" + version digits as raw bytes -> "BAAA.0013".
+        assert_eq!(
+            [r(60), r(61), r(62), r(63)],
+            [0x4241, 0x4141, 0x0000, 0x0103]
+        );
+        assert_eq!(r(64), 4, "modules");
+        assert_eq!(r(65), 24, "cells per module");
+        assert_eq!(r(66), 12, "temperature sensors per module");
+        assert_eq!(r(67), 96, "cells in the stack");
+        assert_eq!(r(68), 48, "temperature sensors in the stack");
+        assert_eq!(r(70), 4, "running mode: discharging");
+        assert_eq!(r(73), 3156, "bus voltage 0.1 V");
+        assert_eq!(r(74), 3156, "battery voltage 0.1 V");
+        assert_eq!(r(76) as i16, -31, "current 0.1 A");
+        assert_eq!(r(79) as i16, -9, "power 0.1 kW");
+        assert_eq!(r(80), 81 << 8, "SOC in the high byte");
+        assert_eq!(r(81), 100, "SOH");
+        assert_eq!(u32_at(&bcu, 22), 291, "lifetime charge 0.1 kWh");
+        assert_eq!(u32_at(&bcu, 24), 196, "lifetime discharge 0.1 kWh");
+        assert_eq!(u32_at(&bcu, 26), 873, "lifetime charge 0.1 Ah");
+        assert_eq!(u32_at(&bcu, 28), 602, "lifetime discharge 0.1 Ah");
+        assert_eq!(u32_at(&bcu, 30), 130, "session charge energy");
+        assert_eq!(u32_at(&bcu, 32), 33, "session discharge energy");
+        assert_eq!(u32_at(&bcu, 34), 402, "session charge 0.1 Ah");
+        assert_eq!(u32_at(&bcu, 36), 106, "session discharge 0.1 Ah");
+        assert_eq!(r(98), 520, "capacity 0.1 Ah");
+        assert_eq!(r(99), 421, "remaining 0.1 Ah (81% of 52.0)");
+        assert_eq!(r(100), 1, "cycles, plain integer");
+        assert_eq!(r(101), 0b0011, "charge and discharge enabled");
+        assert_eq!(r(102), 2544, "min discharge voltage");
+        assert_eq!(r(103), 3485, "max charge voltage");
+        assert_eq!(r(104), 500, "max discharge current 0.1 A");
+        assert_eq!(r(105), 250, "max charge current 0.1 A");
+        assert_eq!(r(106), 0, "fan stopped at 25 C");
+        assert_eq!(u32_at(&bcu, 48), 0b1111, "every module may balance");
+        assert_eq!(r(113), 0b1111, "self-check all OK");
+        assert_eq!(&bcu[54..60], &[0; 6], "no warning/protection/fault");
+    }
+
+    #[test]
+    fn hv_bcu_running_mode_follows_power_and_faults() {
+        let store = RegisterStore::new(default_register_catalogue());
+        let mut stack = reference_hv_stack();
+        let mode = |s: &[sim_models::BatteryState]| store.project_battery_bcu(s)[10];
+        for b in &mut stack {
+            b.power_kw = 0.5;
+        }
+        assert_eq!(mode(&stack), 3, "charging");
+        for b in &mut stack {
+            b.power_kw = 0.0;
+        }
+        assert_eq!(mode(&stack), 2, "standby");
+        stack[0].hv_faults.bcu_fault = 1;
+        assert_eq!(mode(&stack), 5, "fault");
+    }
+
+    #[test]
+    fn hv_bcu_fan_runs_when_hot() {
+        let store = RegisterStore::new(default_register_catalogue());
+        let mut stack = reference_hv_stack();
+        stack[2].temperature_celsius = 41.0;
+        let fan = store.project_battery_bcu(&stack)[46];
+        assert!(fan >> 8 > 0, "fan speed % in the high byte");
+        assert_eq!(fan & 0xFF, 1, "fan status running");
+    }
+
+    #[test]
+    fn hv_bcu_power_does_not_overflow_above_32_kw() {
+        let store = RegisterStore::new(default_register_catalogue());
+        let mut stack = reference_hv_stack();
+        for b in &mut stack {
+            b.power_kw = 10.0; // 40 kW: 400 at 0.1 kW, 40000 W would overflow i16
+        }
+        assert_eq!(store.project_battery_bcu(&stack)[19] as i16, 400);
+    }
+
+    #[test]
+    fn hv_bcu_alarm_words_come_from_the_stack_master() {
+        let store = RegisterStore::new(default_register_catalogue());
+        let mut stack = reference_hv_stack();
+        stack[0].hv_faults = sim_models::HvFaultWords {
+            bcu_warning: 0x0001_0002,
+            bcu_protection: 0x0003_0004,
+            bcu_fault: 0x8000_0000,
+            bmu_fault: 0,
+        };
+        let bcu = store.project_battery_bcu(&stack);
+        assert_eq!(u32_at(&bcu, 54), 0x0001_0002, "IR 114-115 warning");
+        assert_eq!(u32_at(&bcu, 56), 0x0003_0004, "IR 116-117 protection");
+        assert_eq!(u32_at(&bcu, 58), 0x8000_0000, "IR 118-119 fault");
+        assert_eq!(
+            bcu[41] & 0b11,
+            0,
+            "faulted stack: charge/discharge disabled"
+        );
+    }
+
+    #[test]
+    fn hv_bcu_second_block_is_derived_from_the_module_cells() {
+        let store = RegisterStore::new(default_register_catalogue());
+        let mut stack = reference_hv_stack();
+        stack[2].set_cell_override(5, Some(3.6), None); // module 3, cell 6: max
+        stack[1].set_cell_override(0, Some(2.9), None); // module 2, cell 1: min
+        stack[3].set_cell_override(23, None, Some(45.0)); // module 4, cell 24: hot
+        stack[0].set_cell_override(10, None, Some(-5.0)); // module 1, cell 11: cold
+        stack[0].serial = "BATK3F9Q01".into();
+        let bcu = store.project_battery_bcu(&stack);
+        let r = |a: usize| bcu[a - 60];
+
+        assert_eq!(
+            [r(120), r(121), r(122)],
+            [3600, 3, 6],
+            "max cell mV/module/cell"
+        );
+        assert_eq!(
+            [r(123), r(124), r(125)],
+            [2900, 2, 1],
+            "min cell mV/module/cell"
+        );
+        assert_eq!([r(126), r(127), r(128)], [450, 4, 24], "max cell temp");
+        assert_eq!(
+            [r(129) as i16, r(130) as i16, r(131) as i16],
+            [-50, 1, 11],
+            "min temp"
+        );
+        assert_eq!([r(132), r(133)], [250, 250], "busbar temps");
+        assert_eq!(r(134), 700, "voltage spread mV");
+        assert_eq!(r(135), 500, "temperature spread 0.1 C");
+
+        // 136/137: averages of exactly what the BMUs serve.
+        let bmus: Vec<_> = (0..4)
+            .map(|m| store.project_battery_bmu(&stack[m], m))
+            .collect();
+        let mv: Vec<f64> = bmus
+            .iter()
+            .flat_map(|b| b[..24].iter().map(|&v| v as f64))
+            .collect();
+        let t: Vec<f64> = bmus
+            .iter()
+            .flat_map(|b| b[30..54].iter().map(|&v| v as i16 as f64))
+            .collect();
+        assert_eq!(r(136), (mv.iter().sum::<f64>() / 96.0).round() as u16);
+        assert_eq!(r(137) as i16, (t.iter().sum::<f64>() / 96.0).round() as i16);
+
+        assert_eq!(
+            decode_serial(&bcu[78..83]),
+            "BCUK3F9Q01",
+            "IR 138-142 stack serial"
+        );
+        assert!(bcu[83..].iter().all(|&v| v == 0), "IR 143-179 unused");
+        // Without a module serial the stack serial is positional.
+        let plain = store.project_battery_bcu(&reference_hv_stack());
+        assert_eq!(decode_serial(&plain[78..83]), "BCU0000001");
+    }
+
+    #[test]
+    fn hv_bmu_second_block_reports_module_soc_and_balancer() {
+        let store = RegisterStore::new(default_register_catalogue());
+        let mut stack = reference_hv_stack();
+        stack[1].serial = "BATK3F9Q02".into();
+        stack[1].soc_percent = 77.0;
+        stack[1].set_cell_override(4, Some(3.5), Some(-2.0));
+        stack[1].hv_faults.bmu_fault = 0x0001_8000;
+        let bmu = store.project_battery_bmu(&stack[1], 1);
+        let r = |a: usize| bmu[a - 60];
+
+        assert_eq!(r(120), 77, "module SOC");
+        assert_eq!(r(121), 4, "balancer status: fault");
+        assert_eq!(
+            u32_at(&bmu, 62),
+            0x0001_8000,
+            "IR 122-123 module fault word"
+        );
+        let cell_sum: u32 = bmu[..24].iter().map(|&v| v as u32).sum();
+        assert_eq!(
+            r(124),
+            (cell_sum as f64 / 100.0).round() as u16,
+            "module V = sum of cells"
+        );
+        assert_eq!(r(125), 789, "output voltage 0.1 V");
+        assert_eq!(r(126), 250, "balancer temperature");
+        assert_eq!(decode_serial(&bmu[78..83]), "BATK3F9Q02", "balancer serial");
+        let ver: String = bmu[74..78]
             .iter()
             .flat_map(|v| v.to_be_bytes())
-            .map(|b| b as char)
-            .collect::<String>();
-        assert_eq!(prefix, "HV00", "version prefix must be non-blank");
+            .map(char::from)
+            .collect();
+        assert_eq!(ver.len(), 8);
+        assert!(ver.chars().all(|c| c.is_ascii_alphanumeric()), "{ver:?}");
 
-        // IR 64 number_of_modules = 5
-        assert_eq!(bcu[4], 5, "IR(64) must report 5 modules");
-        // IR 65 cells_per_module = 24
-        assert_eq!(bcu[5], 24, "IR(65) must report 24 cells/module");
-        // IR 73 battery_voltage (deci V) = 5 modules x 51.2 V summed = 2560
-        assert_eq!(
-            bcu[13], 2560,
-            "IR(73) stack voltage must sum module voltages"
+        let (max, min) = (
+            bmu[..24].iter().max().unwrap(),
+            bmu[..24].iter().min().unwrap(),
         );
-        // IR 80 SOC duint8: high=max, low=min. All modules 60% -> 0x3C3C
-        assert_eq!(bcu[20], (60 << 8) | 60, "IR(80) SOC max/min");
-        // IR 81 SOH = 95%
-        assert_eq!(bcu[21], 95, "IR(81) SOH");
-        // IR 98 nominal_capacity = (3.4 kWh * 1000 / 76.8 V * 10) rounded
-        // = (3400 / 76.8 * 10).round() = 442.7 -> 443 deci Ah
-        assert_eq!(bcu[38], 443, "IR(98) per-module nominal Ah from 3.4 kWh");
-        // IR 99 remaining = 443 deci Ah * 60% = 265.8 -> 266
-        assert_eq!(bcu[39], 266, "IR(99) remaining capacity scales with SOC");
+        assert_eq!(r(145), 3500);
+        assert_eq!([r(145), r(146)], [*max, *min]);
+        assert_eq!(r(149) as i16, -20, "min cell temp signed");
+        assert_eq!(r(148), 250);
+        assert!(
+            r(151) >= 77 && r(152) <= 77 && r(151) > r(152),
+            "cell SOC max/min"
+        );
+        assert_eq!(r(154), max - min, "voltage spread");
+        assert_eq!(r(155), 270, "temperature spread");
+        assert_eq!(r(156), r(151) - r(152), "SOC spread");
+        // Without the fault, the strong cell drives balancing.
+        stack[1].hv_faults.bmu_fault = 0;
+        let bal = store.project_battery_bmu(&stack[1], 1);
+        assert_eq!(bal[61], 1, "balancer status: balancing");
+        assert_eq!(bal[68], 1 << 4, "IR 128: cell 5 balancing, cells 1-16");
+        assert_eq!(bal[67], 0, "IR 127: no cell 17-24 balancing");
+        assert_eq!(bal[69] as i16, 100, "balance current 1.00 A");
+        assert_ne!(u32_at(&bal, 72), 0, "capacity still to balance");
+        assert_eq!(bmu[67..70], [0, 0, 0], "a faulted balancer stops");
+    }
+
+    #[test]
+    fn hv_bmu_balancer_idles_when_cells_agree_and_temps_are_signed() {
+        let store = RegisterStore::new(default_register_catalogue());
+        let mut b = reference_hv_stack().remove(0);
+        b.temperature_celsius = -3.0;
+        let bmu = store.project_battery_bmu(&b, 0);
+        assert_eq!(bmu[30] as i16, -30, "IR 90 cell temperature is signed");
+        assert_eq!(bmu[66] as i16, -30, "IR 126 balancer temperature is signed");
+        assert_eq!(
+            bmu[61], 2,
+            "standby: the noise is inside the balancing band"
+        );
+        assert_eq!(
+            [bmu[67], bmu[68], bmu[69]],
+            [0, 0, 0],
+            "no balancing, no current"
+        );
     }
 
     #[test]
@@ -9203,6 +9610,101 @@ mod tests {
         assert_eq!(bms1[40], 30); // module 1 SOC
         // Different serials (the whole of IR 110-114)
         assert_ne!(bms0[50..55], bms1[50..55], "Serials should differ");
+    }
+
+    #[test]
+    fn lv_bms_projects_weak_cell_voltage_and_temperature() {
+        let mut state = make_state();
+        state.batteries[0].voltage_v = 51.2;
+        state.batteries[0].temperature_celsius = 25.0;
+        state.sync_battery_from_vec();
+        let store = RegisterStore::new(default_register_catalogue());
+        let before = store.project_battery_bms(&state.batteries[0], 0);
+
+        // Cell 5 (IR 65) weak at 2.900 V and hot at 55.0 °C; cell 12 only cold.
+        state.batteries[0].set_cell_override(5, Some(2.9), Some(55.0));
+        state.batteries[0].set_cell_override(12, None, Some(5.0));
+        state.sync_battery_from_vec();
+        let after = store.project_battery_bms(&state.batteries[0], 0);
+
+        assert_eq!(after[5], 2900, "IR 65 carries the pinned cell voltage (mV)");
+        // Every other cell voltage is unchanged.
+        for i in (0..16).filter(|&i| i != 5) {
+            assert_eq!(after[i], before[i], "cell {i} must not move");
+        }
+        // Cell group temperatures IR 76-79: cells 4-7 form group 1, cells
+        // 12-15 group 3. The hot cell lifts its group; the cold one lowers its.
+        assert_eq!(after[16], before[16], "group 0 (cells 0-3) untouched");
+        assert_eq!(after[17], 550, "IR 77 group 1 reads the hot cell");
+        assert_eq!(after[18], before[18], "group 2 untouched");
+        assert_eq!(after[19], 50, "IR 79 group 3 reads the cold cell");
+        // t_max / t_min (IR 103/104) follow the extremes.
+        assert_eq!(after[43], 550, "IR 103 t_max is the hot cell");
+        assert_eq!(after[44], 50, "IR 104 t_min is the cold cell");
+        // Pack-level registers are untouched: SOC, cells-sum, v_out.
+        assert_eq!(after[40], before[40]);
+        assert_eq!(after[20], before[20]);
+        assert_eq!(after[22..24], before[22..24]);
+    }
+
+    #[test]
+    fn lv_bms_without_overrides_is_unchanged_and_t_min_keeps_its_offset() {
+        let state = make_state();
+        let store = RegisterStore::new(default_register_catalogue());
+        let bms = store.project_battery_bms(&state.batteries[0], 0);
+        let temp_deci = (state.batteries[0].temperature_celsius * 10.0).round() as u16;
+        assert_eq!(bms[43], temp_deci);
+        assert_eq!(bms[44], (temp_deci as f64 * 0.98).round() as u16);
+        for &group_temp in &bms[16..20] {
+            assert_eq!(group_temp, temp_deci);
+        }
+    }
+
+    #[test]
+    fn lv_bms_ignores_overrides_beyond_its_16_cells() {
+        // The HV BMU has 24 cells; a cell 16-23 override must not leak into
+        // the LV projection's other registers (IR 76+ are temperatures).
+        let mut state = make_state();
+        state.batteries[0].set_cell_override(20, Some(1.0), Some(99.0));
+        state.sync_battery_from_vec();
+        let store = RegisterStore::new(default_register_catalogue());
+        let plain = {
+            let mut p = state.clone();
+            p.batteries[0].clear_cell_overrides();
+            store.project_battery_bms(&p.batteries[0], 0)
+        };
+        let bms = store.project_battery_bms(&state.batteries[0], 0);
+        assert_eq!(bms, plain);
+    }
+
+    #[test]
+    fn hv_bmu_projects_weak_cell_voltage_and_temperature() {
+        let mut state = PlantState::with_battery_count(test_ts(), 2);
+        let store = RegisterStore::new(default_register_catalogue());
+        let before1 = store.project_battery_bmu(&state.batteries[1], 1);
+
+        state.batteries[1].set_cell_override(23, Some(2.75), Some(61.3));
+        state.sync_battery_from_vec();
+        let bmu0 = store.project_battery_bmu(&state.batteries[0], 0);
+        let bmu1 = store.project_battery_bmu(&state.batteries[1], 1);
+
+        assert_eq!(bmu1[23], 2750, "IR 83 (cell 24) pinned voltage mV");
+        assert_eq!(
+            bmu1[30 + 23],
+            613,
+            "IR 113 (cell 24) pinned temperature deci °C"
+        );
+        for i in 0..23 {
+            assert_eq!(bmu1[i], before1[i], "cell {i} voltage unchanged");
+            assert_eq!(bmu1[30 + i], before1[30 + i], "cell {i} temp unchanged");
+        }
+        // The other module is unaffected.
+        assert_eq!(bmu0, store.project_battery_bmu(&state.batteries[0], 0));
+        assert_eq!(bmu0[0], {
+            let mut p = state.clone();
+            p.batteries[0].clear_cell_overrides();
+            store.project_battery_bmu(&p.batteries[0], 0)[0]
+        });
     }
 
     // ===================================================================

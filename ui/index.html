@@ -617,6 +617,32 @@
         <div style="font-size:10px;color:var(--text-muted);margin-top:2px">
           Live: <span id="inv-temp-live">—</span> · pins inverter temp (empty = thermal model)
         </div>
+        <label style="margin-top:8px">Weak Cell <span style="color:var(--text-muted)">pins one cell's BMS/BMU reading</span></label>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 6px">
+          <div>
+            <label style="margin-top:0;margin-bottom:2px;font-size:10px">Module (1-6)</label>
+            <input type="number" id="cell-override-module" placeholder="1" min="1" max="6" step="1" inputmode="numeric" title="Battery module (1-6)">
+          </div>
+          <div>
+            <label style="margin-top:0;margin-bottom:2px;font-size:10px">Cell (1-24)</label>
+            <input type="number" id="cell-override-cell" placeholder="1" min="1" max="24" step="1" inputmode="numeric" title="Cell (1-16 on the LV BMS, 1-24 on the HV BMU)">
+          </div>
+          <div>
+            <label style="margin-top:0;margin-bottom:2px;font-size:10px">Volts (0-5)</label>
+            <input type="number" id="cell-override-volts" placeholder="auto" min="0" max="5" step="0.01" inputmode="decimal" title="Cell voltage in V (empty = follow the module)">
+          </div>
+          <div>
+            <label style="margin-top:0;margin-bottom:2px;font-size:10px">Temp °C (-40-150)</label>
+            <input type="number" id="cell-override-temp" placeholder="auto" min="-40" max="150" step="0.5" inputmode="decimal" title="Cell temperature in °C (empty = follow the module)">
+          </div>
+        </div>
+        <div class="row" style="margin-top:4px">
+          <button id="btn-apply-cell-override">Set</button>
+          <button id="btn-clear-cell-overrides" title="Release every pinned cell on every module">Clear</button>
+        </div>
+        <div id="cell-override-list" style="font-size:10px;color:var(--text-muted);margin-top:4px">
+          none active
+        </div>
 
         <label style="margin-top:8px" id="grid-export-limit-label">
           Grid Export Limit (W)
@@ -1286,6 +1312,42 @@
       if (s.ct_meter_installed !== undefined) el('ct-meter-select').value = s.ct_meter_installed ? 'installed' : 'none';
     }
 
+    // ---- Weak cell (per-cell override) display ----
+    function cellOverrideEntries(batteries) {
+      const out = [];
+      (batteries || []).forEach((b, m) => {
+        (b.cell_overrides || []).forEach(o => out.push({ module: m, cell: o.cell, voltage_v: o.voltage_v, temperature_celsius: o.temperature_celsius }));
+      });
+      return out;
+    }
+    function cellOverrideCount(batteries) {
+      return cellOverrideEntries(batteries).length;
+    }
+    // Re-rendered only when the pins change: the state ticks several times a
+    // second, and rebuilding the DOM each tick would flicker the entries and
+    // swallow clicks on their release buttons.
+    let lastCellOverrideSig = null;
+    function updateCellOverrideList(batteries) {
+      const list = el('cell-override-list');
+      if (!list) return;
+      const entries = cellOverrideEntries(batteries);
+      const sig = JSON.stringify(entries);
+      if (sig === lastCellOverrideSig) return;
+      lastCellOverrideSig = sig;
+      if (entries.length === 0) {
+        list.textContent = 'none active';
+        return;
+      }
+      list.innerHTML = entries.map(o => {
+        const v = o.voltage_v !== null && o.voltage_v !== undefined ? Number(o.voltage_v).toFixed(3) + ' V' : '';
+        const t = o.temperature_celsius !== null && o.temperature_celsius !== undefined ? Number(o.temperature_celsius).toFixed(1) + ' °C' : '';
+        const readings = [v, t].filter(Boolean).join(', ');
+        return `<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin:2px 0;color:var(--text);font-size:11px">` +
+          `<span>Module ${o.module + 1} cell ${o.cell + 1}: ${readings}</span>` +
+          `<button class="btn-mini cell-override-release" data-module="${o.module}" data-cell="${o.cell}" title="Release this cell" style="padding:0 6px;line-height:1.4">×</button></div>`;
+      }).join('');
+    }
+
     function updateDashboard(s, fullSync) {
       // Sync sidebar controls from state only on explicit load (not every tick)
       if (fullSync) syncSidebarControls(s);
@@ -1361,6 +1423,8 @@
 
       // Battery module detail panel
       updateBatteryDisplay(s.battery_modules);
+      // Pinned (weak) cells, per module
+      updateCellOverrideList(s.battery_modules);
 
       // Dashboard cards
       el('dash-solar-kwh').innerHTML = `${fmtKwh(s.energy_totals.solar_generation_kwh)} <span class="card-unit">kWh</span>`;
@@ -1424,6 +1488,8 @@
       if (s.solar_override !== null && s.solar_override !== undefined) overrideParts.push('☀️ PV override ' + s.solar_override + 'W');
       if (s.load_override !== null && s.load_override !== undefined) overrideParts.push('🏠 override ' + s.load_override + 'W');
       if (s.inverter_temperature_override !== null && s.inverter_temperature_override !== undefined) overrideParts.push('🌡️ inv temp ' + s.inverter_temperature_override + '°C');
+      const weakCells = cellOverrideCount(s.battery_modules);
+      if (weakCells > 0) overrideParts.push('🔋 ' + weakCells + ' weak cell' + (weakCells === 1 ? '' : 's'));
       el('override-indicator').textContent = overrideParts.join(' | ');
 
             // Schedule display — all slots
@@ -1824,6 +1890,63 @@
         await invoke('set_inverter_temperature', { celsius: null });
         el('footer-info').textContent = 'Inverter temperature override cleared (thermal model active)';
       } catch (e) { console.error('clear inverter temp failed:', e); }
+    });
+    // ---- Weak cell (per-cell override) ----
+    async function sendCellOverride(module, cell, voltage_v, temperature_celsius) {
+      const state = await invoke('set_cell_override', { params: { module, cell, voltage_v, temperature_celsius } });
+      if (state) updateDashboard(state, false);
+    }
+    el('btn-apply-cell-override').addEventListener('click', async () => {
+      const module = parseInt(el('cell-override-module').value, 10);
+      const cell = parseInt(el('cell-override-cell').value, 10);
+      const voltsRaw = el('cell-override-volts').value;
+      const tempRaw = el('cell-override-temp').value;
+      const volts = voltsRaw === '' ? null : parseFloat(voltsRaw);
+      const temp = tempRaw === '' ? null : parseFloat(tempRaw);
+      if (Number.isNaN(module) || module < 1 || module > 6) {
+        el('footer-info').textContent = 'Weak cell: module must be 1-6';
+        return;
+      }
+      if (Number.isNaN(cell) || cell < 1 || cell > 24) {
+        el('footer-info').textContent = 'Weak cell: cell must be 1-24 (1-16 on the LV BMS)';
+        return;
+      }
+      if (volts === null && temp === null) {
+        el('footer-info').textContent = 'Weak cell: give a cell voltage (V), a temperature (°C) or both';
+        return;
+      }
+      if ((volts !== null && (Number.isNaN(volts) || volts < 0 || volts > 5)) ||
+          (temp !== null && (Number.isNaN(temp) || temp < -40 || temp > 150))) {
+        el('footer-info').textContent = 'Weak cell: voltage 0-5 V, temperature -40-150 °C';
+        return;
+      }
+      try {
+        await sendCellOverride(module - 1, cell - 1, volts, temp);
+        const parts = [];
+        if (volts !== null) parts.push(`${volts.toFixed(3)} V`);
+        if (temp !== null) parts.push(`${temp.toFixed(1)} °C`);
+        el('footer-info').textContent = `Module ${module} cell ${cell} pinned to ${parts.join(', ')}`;
+      } catch (e) {
+        console.error('set cell override failed:', e);
+        el('footer-info').textContent = `Weak cell failed: ${e}`;
+      }
+    });
+    el('btn-clear-cell-overrides').addEventListener('click', async () => {
+      try {
+        const state = await invoke('clear_cell_overrides', { params: { module: null } });
+        if (state) updateDashboard(state, false);
+        el('footer-info').textContent = 'All weak cells released';
+      } catch (e) { console.error('clear cell overrides failed:', e); }
+    });
+    el('cell-override-list').addEventListener('click', async (ev) => {
+      const btn = ev.target.closest('.cell-override-release');
+      if (!btn) return;
+      const module = parseInt(btn.dataset.module, 10);
+      const cell = parseInt(btn.dataset.cell, 10);
+      try {
+        await sendCellOverride(module, cell, null, null);
+        el('footer-info').textContent = `Module ${module + 1} cell ${cell + 1} released`;
+      } catch (e) { console.error('release cell override failed:', e); }
     });
 
     // ---- Dongle Misbehaviour ----

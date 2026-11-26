@@ -69,6 +69,15 @@ impl Default for AppState {
 
 // ---------------------------------------------------------------------------
 
+/// One pinned cell reading on a module (see `sim_models::CellOverride`).
+/// `cell` is 0-based, as on the wire (IR 60 + cell).
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+pub struct CellOverrideDto {
+    pub cell: usize,
+    pub voltage_v: Option<f64>,
+    pub temperature_celsius: Option<f64>,
+}
+
 #[derive(serde::Serialize, Clone)]
 pub struct BatteryModuleDto {
     pub soc_percent: f64,
@@ -80,11 +89,22 @@ pub struct BatteryModuleDto {
     pub nominal_capacity_kwh: f64,
     pub soh: f64,
     pub cycle_count: f64,
+    /// Pinned cells on this module, in cell order (empty = none).
+    pub cell_overrides: Vec<CellOverrideDto>,
 }
 
 impl From<&sim_models::BatteryState> for BatteryModuleDto {
     fn from(b: &sim_models::BatteryState) -> Self {
         Self {
+            cell_overrides: b
+                .cell_overrides
+                .iter()
+                .map(|(&cell, o)| CellOverrideDto {
+                    cell,
+                    voltage_v: o.voltage_v,
+                    temperature_celsius: o.temperature_celsius,
+                })
+                .collect(),
             soc_percent: b.soc_percent,
             power_kw: b.power_kw,
             voltage_v: b.voltage_v,
@@ -586,6 +606,27 @@ mod tests {
         assert_eq!(dto.inverter_max_output_w, 8000.0);
         assert_eq!(dto.charge_power_limit_percent, 80.0);
         assert_eq!(dto.discharge_power_limit_percent, 70.0);
+    }
+
+    #[test]
+    fn dto_lists_each_module_cell_overrides_zero_based() {
+        let mut state = PlantState::with_battery_count(ts(), 2);
+        state.batteries[1].set_cell_override(3, Some(2.9), None);
+        state.batteries[1].set_cell_override(0, None, Some(55.0));
+        state.sync_battery_from_vec();
+
+        let dto = PlantStateDto::from(&state);
+
+        assert!(dto.battery_modules[0].cell_overrides.is_empty());
+        let o = &dto.battery_modules[1].cell_overrides;
+        assert_eq!(o.len(), 2);
+        // BTreeMap order: cell 0 first.
+        assert_eq!(o[0].cell, 0);
+        assert_eq!(o[0].voltage_v, None);
+        assert_eq!(o[0].temperature_celsius, Some(55.0));
+        assert_eq!(o[1].cell, 3);
+        assert_eq!(o[1].voltage_v, Some(2.9));
+        assert_eq!(o[1].temperature_celsius, None);
     }
 
     #[test]

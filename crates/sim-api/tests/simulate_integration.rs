@@ -1473,6 +1473,53 @@ async fn bms_slave_0x33_returns_battery_1_data() {
 }
 
 #[tokio::test]
+async fn weak_cell_override_is_served_on_the_lv_bms_and_hv_bmu_slaves() {
+    let mut state = PlantState::with_battery_count(
+        NaiveDate::from_ymd_opt(2025, 6, 21)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap(),
+        2,
+    );
+    // Module 2, cell 6: weak (2.900 V) and hot (55.0 °C).
+    state.batteries[1].set_cell_override(5, Some(2.9), Some(55.0));
+    state.sync_battery_from_vec();
+
+    let h = TestHarness::new(state, 5).await;
+    let mut s = h.connect().await;
+
+    // LV BMS: slave 0x33 is module 2. IR 65 = cell 6 voltage (mV),
+    // IR 77 = cell group 1 (cells 4-7) temperature, IR 103 = t_max.
+    let bms1 = h.read_ir_slave(&mut s, 0x33, 60, 60).await;
+    assert_eq!(bms1[5], 2900, "slave 0x33 IR 65 pinned cell voltage");
+    assert_eq!(
+        bms1[17], 550,
+        "slave 0x33 IR 77 group temp follows the hot cell"
+    );
+    assert_eq!(
+        bms1[43], 550,
+        "slave 0x33 IR 103 t_max follows the hot cell"
+    );
+    // Module 1 (slave 0x32) is untouched: its cell 6 reads near 3.2 V.
+    let bms0 = h.read_ir_slave(&mut s, 0x32, 60, 60).await;
+    assert!(
+        (3000..3600).contains(&bms0[5]),
+        "slave 0x32 IR 65 should be an ordinary cell, got {} mV",
+        bms0[5]
+    );
+
+    // HV BMU: slave 0x51 is module 2. IR 65 = cell 6 voltage, IR 95 = cell 6 temp.
+    let bmu1 = h.read_ir_slave(&mut s, 0x51, 60, 60).await;
+    assert_eq!(bmu1[5], 2900, "slave 0x51 IR 65 pinned cell voltage");
+    assert_eq!(bmu1[35], 550, "slave 0x51 IR 95 pinned cell temperature");
+    assert_ne!(bmu1[4], 2900, "neighbouring cell keeps its own voltage");
+
+    // The override survives ticking (the harness ran 5 ticks before serving).
+    let bmu0 = h.read_ir_slave(&mut s, 0x50, 60, 60).await;
+    assert_ne!(bmu0[5], 2900, "module 1 BMU is untouched");
+}
+
+#[tokio::test]
 async fn bms_slave_0x34_returns_battery_2_data() {
     let mut state = PlantState::with_battery_count(
         NaiveDate::from_ymd_opt(2025, 6, 21)
@@ -1607,7 +1654,7 @@ async fn hv_bcu_reports_module_count() {
     assert_eq!(data[4], 5, "BCU IR(64) should report 5 modules");
     assert_eq!(data[5], 24, "BCU IR(65) cells_per_module should be 24");
     // Version prefix should be 'HV' → 0x4856
-    assert_eq!(data[0], 0x4856, "BCU version prefix should be 'HV'");
+    assert_eq!(data[0], 0x4241, "BCU version prefix should be 'BA'");
 }
 
 #[tokio::test]
