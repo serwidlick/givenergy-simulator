@@ -965,6 +965,13 @@
             <input type="range" class="battery-soh" data-idx="${idx}" min="50" max="100" value="100" step="1"
               style="flex:1;height:14px;accent-color:var(--accent)">
             <span class="soh-label" data-idx="${idx}" style="font-size:10px;min-width:30px;text-align:right">100%</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:4px;margin-top:2px;">
+            <span style="font-size:9px;color:var(--text-muted);min-width:28px">Cycles</span>
+            <input type="number" class="battery-cycles" data-idx="${idx}" min="0" step="1" placeholder="0"
+              title="Equivalent full cycles (IR 96). Moving SoH or Create Plant re-derives it from SoH."
+              style="flex:1;min-width:0;font-size:10px">
+            <button class="battery-cycles-set" data-idx="${idx}" style="font-size:10px">Set</button>
           </div>`;
         container.appendChild(div);
         // Wire SoH slider
@@ -977,6 +984,13 @@
             try { await invoke('set_battery_soh', { params: { module: idx, soh: pct / 100.0 } }); }
             catch (e) { console.error('set_battery_soh failed:', e); }
           }
+        });
+        const cyclesInput = div.querySelector('.battery-cycles');
+        div.querySelector('.battery-cycles-set').addEventListener('click', async () => {
+          const cycles = parseFloat(cyclesInput.value);
+          if (!invoke || !(cycles >= 0)) return;
+          try { await invoke('set_battery_cycles', { params: { module: idx, cycles } }); }
+          catch (e) { console.error('set_battery_cycles failed:', e); }
         });
       }
       while (container.querySelectorAll('.battery-module').length > count) {

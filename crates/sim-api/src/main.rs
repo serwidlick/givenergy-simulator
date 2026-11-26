@@ -158,6 +158,13 @@ enum Commands {
         #[arg(long, default_value = "100")]
         battery_soh: f64,
 
+        /// Battery cycle count (equivalent full cycles) for all modules.
+        ///
+        /// Overrides the count derived from `--battery-soh` without changing
+        /// SoH, e.g. `--battery-cycles 6000`. Omit to derive it from SoH.
+        #[arg(long)]
+        battery_cycles: Option<f64>,
+
         /// Solar PV peak capacity in watts.
         ///
         /// Determines maximum generation under ideal conditions.
@@ -686,6 +693,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             battery_size,
             soc,
             battery_soh,
+            battery_cycles,
             solar_peak,
             load_level,
             load_profile,
@@ -713,6 +721,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 battery_size,
                 soc,
                 battery_soh,
+                battery_cycles,
                 solar_peak,
                 load_level,
                 &load_profile,
@@ -871,6 +880,7 @@ async fn simulate(
     battery_size: f64,
     soc: f64,
     battery_soh: f64,
+    battery_cycles: Option<f64>,
     solar_peak: f64,
     load_level: f64,
     load_profile: &str,
@@ -912,6 +922,12 @@ async fn simulate(
     let mut state = PlantState::with_battery_count(start_ts, battery_count);
     state.batteries =
         build_simulate_batteries(inv_type, battery_count, battery_size, soc, battery_soh);
+    if let Some(cycles) = battery_cycles {
+        state
+            .batteries
+            .iter_mut()
+            .for_each(|b| b.set_cycles(cycles));
+    }
     state.sync_battery_from_vec();
 
     // Configure inverter
@@ -2150,6 +2166,20 @@ mod tests {
             Commands::Simulate { battery_soh, .. } => assert_eq!(battery_soh, 100.0),
             _ => panic!("expected simulate"),
         }
+    }
+
+    #[test]
+    fn simulate_cli_battery_cycles_is_optional() {
+        use clap::Parser;
+        let parse = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Commands::Simulate { battery_cycles, .. } => battery_cycles,
+            _ => panic!("expected simulate"),
+        };
+        assert_eq!(parse(&["giv-sim", "simulate"]), None);
+        assert_eq!(
+            parse(&["giv-sim", "simulate", "--battery-cycles", "6000"]),
+            Some(6000.0)
+        );
     }
 
     #[test]

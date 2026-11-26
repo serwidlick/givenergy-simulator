@@ -1164,6 +1164,12 @@ pub struct SetBatterySohParams {
     pub soh: f64,
 }
 
+#[derive(serde::Deserialize)]
+pub struct SetBatteryCyclesParams {
+    pub module: usize,
+    pub cycles: f64,
+}
+
 #[tauri::command]
 pub async fn set_battery_soc(
     app: AppHandle,
@@ -1247,6 +1253,34 @@ pub async fn set_battery_soh(
         }
         e.state.sync_battery_from_vec();
         // Update register store so IR 6-7 reflect the new throughput immediately
+        {
+            let mut rs = state.register_store.lock().await;
+            rs.project_from_state(&e.state);
+        }
+        let sched_ref = state.schedule.lock().await.clone();
+        let dto = PlantStateDto::with_schedule(&e.state, sched_ref.as_ref());
+        let _ = app.emit("state_changed", &dto);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_battery_cycles(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    params: SetBatteryCyclesParams,
+) -> Result<(), String> {
+    let mut eng = state.engine.lock().await;
+    if let Some(ref mut e) = *eng {
+        if let Some(b) = e.state.batteries.get_mut(params.module) {
+            b.set_cycles(params.cycles);
+            tracing::info!(
+                "Set battery cycles: module={}, cycles={}",
+                params.module,
+                b.cycle_count
+            );
+        }
+        e.state.sync_battery_from_vec();
         {
             let mut rs = state.register_store.lock().await;
             rs.project_from_state(&e.state);

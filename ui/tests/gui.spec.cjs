@@ -661,3 +661,13 @@ test('grid export limit note reclassifies on inverter-type change', async ({ pag
   await page.selectOption('#inverter-type', 'Gateway12kW');
   await expect(page.locator('#grid-export-limit-note')).toHaveText(/HR 2071/);
 });
+
+test('sidebar Cycles Set sends set_battery_cycles for that module', async ({ page }) => {
+  await setupPage(page);
+  await page.locator('.battery-cycles').nth(1).fill('6000');
+  await page.locator('.battery-cycles-set').nth(1).click();
+  await page.waitForTimeout(100);
+  const c = (await getCalls(page)).find(x => x.cmd === 'set_battery_cycles');
+  expect(c).toBeTruthy();
+  expect(p(c)).toEqual({ module: 1, cycles: 6000 });
+});

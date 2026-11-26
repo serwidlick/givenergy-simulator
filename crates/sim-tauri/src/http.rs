@@ -355,6 +355,10 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, (u16
             let params = param!(args);
             ok(c::set_battery_soh(app.clone(), state, params).await)
         }
+        "set_battery_cycles" => {
+            let params = param!(args);
+            ok(c::set_battery_cycles(app.clone(), state, params).await)
+        }
         "start_calibration" => {
             let params = param!(args);
             ok(c::start_calibration(app.clone(), state, params).await)

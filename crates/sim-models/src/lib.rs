@@ -1051,6 +1051,16 @@ impl BatteryState {
     pub fn clear_cell_overrides(&mut self) {
         self.cell_overrides.clear();
     }
+
+    /// Set the equivalent full cycle count (and the matching throughput,
+    /// which the engine derives cycles from each tick) without touching
+    /// SoH, so a pack can report many cycles at any health. Negative or NaN
+    /// is treated as 0. A later `apply_soh` re-derives cycles from SoH.
+    pub fn set_cycles(&mut self, cycles: f64) {
+        let cycles = if cycles > 0.0 { cycles } else { 0.0 };
+        self.cycle_count = cycles;
+        self.throughput_kwh = cycles * self.nominal_capacity_kwh.max(0.1);
+    }
 }
 
 impl Default for BatteryState {
@@ -2793,6 +2803,25 @@ mod tests {
         let mut b = BatteryState::default();
         b.apply_soh(1.7, 10.0);
         assert_eq!(b.soh, 1.0);
+    }
+
+    #[test]
+    fn set_cycles_sets_history_without_touching_soh() {
+        let mut b = BatteryState {
+            nominal_capacity_kwh: 8.2,
+            ..BatteryState::default()
+        };
+        b.apply_soh(0.95, 10.0);
+        let (soh, cap, limit) = (b.soh, b.capacity_kwh, b.max_charge_kw);
+        b.set_cycles(6000.0);
+        assert_eq!(b.cycle_count, 6000.0);
+        assert!((b.throughput_kwh - 6000.0 * 8.2).abs() < 1e-9);
+        assert_eq!((b.soh, b.capacity_kwh, b.max_charge_kw), (soh, cap, limit));
+        for bad in [-5.0, f64::NAN] {
+            b.set_cycles(bad);
+            assert_eq!(b.cycle_count, 0.0, "requested {bad}");
+            assert_eq!(b.throughput_kwh, 0.0, "requested {bad}");
+        }
     }
 
     /// Regression: the EMS export-slot registers (HR 2062-2070) were

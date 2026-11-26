@@ -61,6 +61,7 @@ pub fn run() {
             commands::set_load_override,
             commands::set_battery_soc,
             commands::set_battery_soh,
+            commands::set_battery_cycles,
             commands::export_recording,
             commands::get_current_state,
             commands::save_plant,
