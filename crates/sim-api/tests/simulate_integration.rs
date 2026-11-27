@@ -1484,6 +1484,9 @@ async fn weak_cell_override_is_served_on_the_lv_bms_and_hv_bmu_slaves() {
     // Module 2, cell 6: weak (2.900 V) and hot (55.0 °C).
     state.batteries[1].set_cell_override(5, Some(2.9), Some(55.0));
     state.sync_battery_from_vec();
+    // HV slaves only answer on an HV inverter type, so serve one of each.
+    let mut hv_state = state.clone();
+    hv_state.config.inverter_type = "ThreePhase".to_string();
 
     let h = TestHarness::new(state, 5).await;
     let mut s = h.connect().await;
@@ -1507,6 +1510,9 @@ async fn weak_cell_override_is_served_on_the_lv_bms_and_hv_bmu_slaves() {
         "slave 0x32 IR 65 should be an ordinary cell, got {} mV",
         bms0[5]
     );
+
+    let h = TestHarness::new(hv_state, 5).await;
+    let mut s = h.connect().await;
 
     // HV BMU: slave 0x51 is module 2. IR 65 = cell 6 voltage, IR 95 = cell 6 temp.
     let bmu1 = h.read_ir_slave(&mut s, 0x51, 60, 60).await;
@@ -1622,6 +1628,7 @@ async fn hv_bms_discovery_reports_one_bcu() {
         b.voltage_v = 51.2;
         b.soh = 0.95;
     }
+    state.config.inverter_type = "ThreePhase".to_string();
     state.sync_battery_from_vec();
 
     let h = TestHarness::new(state, 1).await;
@@ -1644,6 +1651,7 @@ async fn hv_bcu_reports_module_count() {
     for b in &mut state.batteries {
         b.soc_percent = 55.0;
     }
+    state.config.inverter_type = "ThreePhase".to_string();
     state.sync_battery_from_vec();
 
     let h = TestHarness::new(state, 1).await;
@@ -1670,6 +1678,7 @@ async fn hv_bmu_per_module_has_cells_and_serial() {
         b.soc_percent = 60.0;
         b.voltage_v = 51.2;
     }
+    state.config.inverter_type = "ThreePhase".to_string();
     state.sync_battery_from_vec();
 
     let h = TestHarness::new(state, 1).await;
@@ -1715,6 +1724,7 @@ async fn hv_absent_bmu_returns_zeros() {
     for b in &mut state.batteries {
         b.soc_percent = 50.0;
     }
+    state.config.inverter_type = "ThreePhase".to_string();
     state.sync_battery_from_vec();
 
     let h = TestHarness::new(state, 1).await;

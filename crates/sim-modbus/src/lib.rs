@@ -76,11 +76,12 @@ pub const SERIAL_LEN: usize = 10;
 /// + func_id(1) + serial(10) + padding(8) = 26 bytes.
 pub const HEADER_SIZE: usize = 2 + 2 + 2 + 1 + 1 + SERIAL_LEN + 8;
 
-/// Default inverter serial number (10 bytes, Latin-1, space-padded).
+/// Default inverter serial number (10 bytes, Latin-1). All 10 must be
+/// non-space: release builds of the app reject serials shorter than 10.
 /// The outer envelope always carries the data-adapter (dongle) serial from
 /// the client request. The inner response payload must carry the *inverter*
 /// serial so the client can identify which inverter is responding.
-pub const INVERTER_SERIAL: [u8; SERIAL_LEN] = *b"GE0000000 ";
+pub const INVERTER_SERIAL: [u8; SERIAL_LEN] = *b"GE00000000";
 
 // ---------------------------------------------------------------------------
 // Inner Modbus function codes
@@ -474,9 +475,10 @@ pub async fn run_modbus_server(
                             // HV protocol (v4.4.1 §4.4.2), one stack, no BAMS: 0xA0
                             //   config (IR 60-119), 0x70 BCU and 0x50+m BMU (IR 60-179).
                             // HV inverters (DTC family 4/8) are discovered via the
-                            // cluster path; LV inverters via 0x32-0x37. Both are
-                            // served unconditionally — clients only probe the path
-                            // matching the inverter's DTC.
+                            // cluster path; LV inverters via 0x32-0x37. The HV
+                            // slaves only answer on HV inverter types: the app probes
+                            // HV first whatever the DTC, so an LV type that answered
+                            // would always show an HV stack.
                             enum BatteryRead {
                                 LvBms(usize),
                                 HvBmsConfig,
@@ -487,8 +489,11 @@ pub async fn run_modbus_server(
                                 start_addr >= 60 && start_addr as u32 + count as u32 <= end
                             };
                             let hv_slave = (0x50..=0xA0).contains(&slave); // BMU, BCU, BAMS, config
+                            let hv_absent = hv_slave && !store.lock().await.has_hv_battery();
                             let battery_read = if inner_func == FC_READ_INPUT {
-                                if slave == 0xA0 && within(120) {
+                                if hv_absent {
+                                    None // refused below with exception 0x02
+                                } else if slave == 0xA0 && within(120) {
                                     Some(BatteryRead::HvBmsConfig)
                                 } else if slave == 0x70 && within(180) {
                                     Some(BatteryRead::HvBcu)
