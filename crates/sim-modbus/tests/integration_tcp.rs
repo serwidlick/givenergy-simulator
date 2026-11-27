@@ -380,6 +380,7 @@ async fn hv_battery_cluster_discovery_serves_bms_bcu_and_bmus() {
             .and_hms_opt(12, 0, 0)
             .unwrap(),
     );
+    state.config.inverter_type = "ThreePhase".to_string();
     // Build a 5-module HV stack.
     state.batteries = (0..5)
         .map(|_| sim_models::BatteryState {
@@ -447,6 +448,7 @@ async fn hv_second_blocks_config_block_and_unmodelled_ranges() {
         b.soc_percent = 81.0;
     }
     state.batteries[0].serial = "BATK3F9Q01".into();
+    state.config.inverter_type = "ThreePhase".to_string();
     state.sync_battery_from_vec();
     let (addr, _store, _rx) = start_server(&state).await;
     let serial = serial_arr();
@@ -499,6 +501,31 @@ async fn hv_second_blocks_config_block_and_unmodelled_ranges() {
         assert_eq!(func, FC_READ_INPUT | 0x80, "slave {slave:#04x} IR {start}");
         assert_eq!(payload[10], EC_ILLEGAL_DATA_ADDRESS);
     }
+}
+
+#[tokio::test]
+async fn lv_inverter_refuses_hv_battery_slaves_and_serves_lv() {
+    let ts = chrono::NaiveDate::from_ymd_opt(2025, 6, 1)
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap();
+    let mut state = PlantState::new(ts);
+    state.config.inverter_type = "ACCoupled".to_string();
+    state.sync_battery_from_vec();
+    let (addr, _store, _rx) = start_server(&state).await;
+    let serial = serial_arr();
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+    for slave in [0xA0, 0x70, 0x50] {
+        let req = build_read_request(&serial, slave, FC_READ_INPUT, 60, 60);
+        let (_, func, payload) = decode_response(&send_recv(&mut stream, &req).await);
+        assert_eq!(func, FC_READ_INPUT | 0x80, "slave {slave:#04x}");
+        assert_eq!(payload[10], EC_ILLEGAL_DATA_ADDRESS);
+    }
+
+    let req = build_read_request(&serial, 0x32, FC_READ_INPUT, 60, 60);
+    let (_, func, _) = decode_response(&send_recv(&mut stream, &req).await);
+    assert_eq!(func, FC_READ_INPUT, "LV module still answers");
 }
 
 #[tokio::test]

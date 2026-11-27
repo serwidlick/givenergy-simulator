@@ -447,6 +447,12 @@ impl RegisterStore {
         is_three_phase_inverter(&self.inverter_type)
     }
 
+    /// Whether the configured inverter type carries an HV battery stack
+    /// (BCU/BMU slaves) rather than LV modules on 0x32-0x37.
+    pub fn has_hv_battery(&self) -> bool {
+        sim_models::is_hv_inverter_type(&self.inverter_type)
+    }
+
     /// Returns true when a holding-register read overlaps a model-specific
     /// bank that is absent on the configured inverter type.
     pub fn holding_range_absent_for_device(&self, start: u16, count: u16) -> bool {
